@@ -69,7 +69,7 @@ Local `score.py` on the organiser's 30 sample commits (simulated seconds, CPU no
 
 Practice board (hidden commits, middle of 3 runs): v1 scored 497.0 s (195.6 s plus one missed commit; 1.4 s CPU).
 
-Mutation testing (`tools/mutate.py`, random operator, constant, boolean, comment and fixture edits, every unselected test run for real): 160 mutants so far; the one miss found (a dialect class constant) is fixed in v3.
+Mutation testing (`tools/mutate.py`, random operator, constant, boolean, comment and fixture edits, every unselected test run for real): 120 mutants so far; the one miss found (a dialect class constant) is fixed in v3.
 
 ## Limitations
 
