@@ -31,6 +31,7 @@ class Maps:
     fixtures: dict[str, list[int]]
     tests_by_file: dict[str, set[int]]
     classes: dict[str, list[int]] = field(default_factory=dict)
+    enums: frozenset[str] = frozenset()
 
 
 def _start(node: ast.AST) -> int:
@@ -89,6 +90,51 @@ def _own_lines(stmt: ast.stmt) -> tuple[int, int]:
     if not children:
         return _start(stmt), stmt.end_lineno
     return _start(stmt), max(_start(stmt), min(children) - 1)
+
+
+class _Canonical(ast.NodeTransformer):
+    """Rewrite comparisons whose `is` and `==` forms behave the same in sqlglot.
+
+    `x == None` / `x != None` become `is` / `is not` (every sqlglot __eq__ except the
+    executor's sort wrapper returns False for None), and the same for members of
+    identity-compared Enums (`x == ScopeType.ROOT`).
+    """
+
+    def __init__(self, enums: frozenset[str]) -> None:
+        self.enums = enums
+
+    def _identity_safe(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Constant) and node.value is None:
+            return True
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, (ast.Name, ast.Attribute))
+            and (node.value.id if isinstance(node.value, ast.Name) else node.value.attr) in self.enums
+        )
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        self.generic_visit(node)
+        operands = [node.left, *node.comparators]
+        ops = []
+        for i, op in enumerate(node.ops):
+            safe = self._identity_safe(operands[i]) or self._identity_safe(operands[i + 1])
+            if safe and isinstance(op, ast.Eq):
+                op = ast.Is()
+            elif safe and isinstance(op, ast.NotEq):
+                op = ast.IsNot()
+            ops.append(op)
+        node.ops = ops
+        return node
+
+
+EQ_UNSAFE_FILES = ("sqlglot/executor/env.py",)
+
+
+def _canonical_dump(text: str, path: str, enums: frozenset[str]) -> str:
+    tree = ast.parse(text)
+    if path not in EQ_UNSAFE_FILES:
+        tree = _Canonical(enums).visit(tree)
+    return ast.dump(tree)
 
 
 def _code_line(lines: list[str], idx: int, step: int) -> int | None:
@@ -276,9 +322,10 @@ class Analyzer:
         except (OSError, SyntaxError, ValueError):
             return ALL
         old_lines = old_text.split("\n")
-        old_dump = ast.dump(old_tree)
+        enums = self.maps.enums
+        old_dump = _canonical_dump(old_text, path, enums)
         try:
-            full_dump = ast.dump(ast.parse("\n".join(apply_hunks(old_lines, fd.hunks))))
+            full_dump = _canonical_dump("\n".join(apply_hunks(old_lines, fd.hunks)), path, enums)
         except (SyntaxError, ValueError):
             return self._broken(path)
         if full_dump == old_dump:
@@ -293,11 +340,12 @@ class Analyzer:
 
     def _hunk(self, path, old_tree, old_dump, old_lines, hunk: Hunk):
         new_lines = apply_hunks(old_lines, [hunk])
+        new_text = "\n".join(new_lines)
         try:
-            new_tree = ast.parse("\n".join(new_lines))
+            new_tree = ast.parse(new_text)
         except (SyntaxError, ValueError):
             return self._broken(path)
-        if ast.dump(new_tree) == old_dump:
+        if _canonical_dump(new_text, path, self.maps.enums) == old_dump:
             return set()
         parts = [self._old_line(path, old_tree, line) for line in hunk.removed_lines()]
         for point, new_line in _added(hunk):

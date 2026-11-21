@@ -40,10 +40,13 @@ def load_maps(tests: list[dict]) -> Maps:
     if (MAPS / "classes.json.gz").exists():
         with gzip.open(MAPS / "classes.json.gz", "rt", encoding="utf-8") as handle:
             classes = json.load(handle)
+    enums: frozenset[str] = frozenset()
+    if (MAPS / "enums.json").exists():
+        enums = frozenset(json.loads((MAPS / "enums.json").read_text()))
     by_file: dict[str, set[int]] = defaultdict(set)
     for test in tests:
         by_file[test["file"]].add(test["number"])
-    return Maps(coverage=coverage, fixtures=fixtures, tests_by_file=dict(by_file), classes=classes)
+    return Maps(coverage=coverage, fixtures=fixtures, tests_by_file=dict(by_file), classes=classes, enums=enums)
 
 
 def select(analyzer: Analyzer, patch_text: str, everything: set[int]) -> set[int]:
