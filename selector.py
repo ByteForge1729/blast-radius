@@ -47,11 +47,15 @@ def load_maps(tests: list[dict]) -> Maps:
     import_lines: dict[str, list[int]] = {}
     if (MAPS / "import_lines.json").exists():
         import_lines = json.loads((MAPS / "import_lines.json").read_text())
+    import_groups: dict = {}
+    if (MAPS / "import_groups.json.gz").exists():
+        with gzip.open(MAPS / "import_groups.json.gz", "rt", encoding="utf-8") as handle:
+            import_groups = json.load(handle)
     by_file: dict[str, set[int]] = defaultdict(set)
     for test in tests:
         by_file[test["file"]].add(test["number"])
     return Maps(coverage=coverage, fixtures=fixtures, tests_by_file=dict(by_file), classes=classes, enums=enums,
-                import_lines=import_lines)
+                import_lines=import_lines, import_groups=import_groups)
 
 
 def select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: list[str]) -> set[int]:

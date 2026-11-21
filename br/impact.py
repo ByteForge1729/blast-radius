@@ -37,6 +37,7 @@ class Maps:
     classes: dict[str, list[int]] = field(default_factory=dict)
     enums: frozenset[str] = frozenset()
     import_lines: dict[str, list[int]] = field(default_factory=dict)
+    import_groups: dict = field(default_factory=dict)  # {"lines": {file: {line: [gid]}}, "groups": {gid: tests|"ALL"}}
 
 
 ASSIGN_TYPES = (ast.Assign, ast.AnnAssign, ast.AugAssign)
@@ -171,6 +172,19 @@ class Analyzer:
         self.import_time: dict[str, str] = {}  # path -> patched source, for the import check
         self._touched_import_time = False
 
+    def _import_effect(self, path: str, start: int, end: int) -> set[int] | None:
+        """Tests that depend on lines start..end through what they build at import time."""
+        lines = self.maps.import_groups.get("lines", {}).get(path, {})
+        groups = self.maps.import_groups.get("groups", {})
+        tests: set[int] = set()
+        for line in range(start, end + 1):
+            for gid in lines.get(str(line), ()):
+                group = groups.get(str(gid))
+                if group == "ALL":
+                    return ALL
+                tests.update(group or ())
+        return tests
+
     def _mark_import_time(self, path: str, start: int, end: int) -> None:
         lines = self.maps.import_lines.get(path, ())
         if any(start <= line <= end for line in lines):
@@ -179,13 +193,18 @@ class Analyzer:
     def _narrow(self, path: str, stmt: ast.AST | None, defining, broad: set[int] | None):
         """Intersect a broad selection with the tests that read the assigned names."""
         names = _assigned_names(stmt) if stmt is not None else None
-        if broad is ALL or not names or not self.maps.import_lines:
-            return broad
+        if broad is ALL:
+            return ALL
+        # Import-time state derived from a class/module statement is only used by that
+        # class's users, which `broad` already holds; crashes are caught by the import check.
+        unbounded = broad
+        if not names or not self.maps.import_lines:
+            return unbounded
         readers: set[int] = set()
         for name in names:
             sites = self.readers.reader_lines(name, defining)
             if sites is None:
-                return broad
+                return unbounded
             for site_path, start, end in sites:
                 readers |= self._range(site_path, start, end)
         return broad & readers
@@ -266,9 +285,9 @@ class Analyzer:
         stmts = [n for n in chain[idx + 1:] if isinstance(n, ast.stmt)]
         if not stmts:
             return self._lines(path, {line})
-        start, end = _own_lines(stmts[-1])
-        self._mark_import_time(path, min(start, line), max(end, line))
-        return self._range(path, min(start, line), max(end, line))
+        start, end = min(_own_lines(stmts[-1])[0], line), max(_own_lines(stmts[-1])[1], line)
+        self._mark_import_time(path, start, end)
+        return _union([self._range(path, start, end), self._import_effect(path, start, end)])
 
     # ---- per-insertion analysis on the new tree ---------------------------
     def _insertion(self, path, old_tree, old_lines, new_tree, new_line: int, point: int):
@@ -278,7 +297,8 @@ class Analyzer:
             self._touched_import_time = True
             stmts = [n for n in chain if isinstance(n, ast.stmt)]
             stmt = stmts[-1] if stmts else None
-            return self._narrow(path, stmt, (path, 0, -1), self._broad_new(path, old_tree, chain))
+            # a new import-time statement runs where its neighbours ran: use their import groups
+            return self._narrow(path, stmt, (path, max(point - 1, 1), point), self._broad_new(path, old_tree, chain))
         named = [n for n in chain if isinstance(n, NAMED_FUNCS)]
         if named:
             qual = _qualname(chain[: chain.index(named[-1]) + 1])
