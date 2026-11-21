@@ -21,6 +21,7 @@ sys.path.insert(0, str(HERE))
 from br.diff import parse_patch  # noqa: E402
 from br.impact import ALL, Analyzer, Maps  # noqa: E402
 from br.importcheck import ImportChecker  # noqa: E402
+from br import probe  # noqa: E402
 from br.schedule import split  # noqa: E402
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -67,19 +68,77 @@ def load_maps(tests: list[dict]) -> Maps:
     )
 
 
+MAX_PROBE_QUERIES = 30
+
+
+class TpcdsProbe:
+    """Decides test_execute_tpcds by running only the queries a function edit can reach."""
+
+    def __init__(self, tests: list[dict], src_root: str) -> None:
+        raw = _load("tpcds_queries.json.gz") or {}
+        self.lines: dict[str, dict] = raw.get("lines", {})
+        self.src_root = src_root
+        self.number = next((t["number"] for t in tests if t["id"] == probe.TEST_ID), None)
+
+    def queries(self, ranges: list[tuple[str, int, int]]) -> set[int]:
+        out: set[int] = set()
+        for path, start, end in ranges:
+            lines = self.lines.get(path, {})
+            for line in range(start, end + 1):
+                out.update(lines.get(line, lines.get(str(line), ())))
+        return out
+
+    def prune(self, analyzer: Analyzer, chosen: set[int]) -> set[int]:
+        if self.number not in chosen or not self.lines or analyzer.import_time:
+            return chosen
+        ranges = analyzer.changed_ranges
+        if not ranges:
+            return chosen
+        queries = self.queries(ranges)
+        if not queries or len(queries) > MAX_PROBE_QUERIES:
+            log(f"  tpcds probe skipped: {len(queries)} queries")
+            return chosen
+        passed = probe.run_queries(self.src_root, analyzer.patched_sources, sorted(queries))
+        log(f"  tpcds probe on {len(queries)} queries: {'pass, dropping it' if passed else 'fail, keeping it'}")
+        return chosen - {self.number} if passed else chosen
+
+
 def select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: list[str],
-           checker: ImportChecker) -> set[int]:
-    chosen: set[int] = set()
-    analyzer.import_time = {}
+           checker: ImportChecker, tpcds: TpcdsProbe | None = None) -> set[int]:
+    chosen = _select(analyzer, patch_text, everything, modules, checker)
+    if tpcds is not None and chosen != everything:
+        chosen = tpcds.prune(analyzer, chosen)
+    return chosen
+
+
+def _select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: list[str],
+            checker: ImportChecker) -> set[int]:
+    analyzer.reset()
+    per_file: list[tuple[str, set[int] | None]] = []
     for file_diff in parse_patch(patch_text):
-        got = analyzer.tests_for(file_diff)
-        if got is ALL:
-            return set(everything)
-        chosen |= got
-    if analyzer.import_time and checker.crashes(analyzer.import_time):
+        per_file.append((file_diff.path, analyzer.tests_for(file_diff)))
+    conservative = _union(got for _, got in per_file)
+    if not analyzer.import_time:
+        return set(everything) if conservative is ALL else conservative & everything
+    crashed, changed = checker.check(analyzer.import_time)
+    if crashed:
         log("  import-time crash detected: selecting every test")
         return set(everything)
-    return chosen & everything
+    refined = analyzer.refine(changed)
+    others = _union(got for path, got in per_file if path not in analyzer.refine_info)
+    if refined is not None and others is not ALL:
+        log(f"  import-time state changed: {sorted(changed)[:6]}")
+        return (refined | others) & everything
+    return set(everything) if conservative is ALL else conservative & everything
+
+
+def _union(parts) -> set[int] | None:
+    out: set[int] = set()
+    for part in parts:
+        if part is ALL:
+            return ALL
+        out |= part
+    return out
 
 
 def collection_modules() -> list[str]:
@@ -101,9 +160,11 @@ def main() -> None:
     analyzer = Analyzer(SRC, load_maps(tests))
     modules = collection_modules()
     checker = ImportChecker(SRC, modules, analyzer.maps.import_groups.get("dependents", {}))
+    tpcds = TpcdsProbe(tests, SRC)
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
-            chosen = select(analyzer, patch.read_text(encoding="utf-8", errors="replace"), everything, modules, checker)
+            chosen = select(analyzer, patch.read_text(encoding="utf-8", errors="replace"), everything, modules,
+                            checker, tpcds)
         except Exception as error:  # noqa: BLE001 - a crash must never cost a miss
             log(f"{patch.stem}: fallback to all tests ({type(error).__name__}: {error})")
             chosen = set(everything)

@@ -15,6 +15,12 @@ with tarfile.open(fileobj=io.BytesIO(data)) as tar:
 os.rename(f"/opt/sqlglot-{sha}", "/opt/sqlglot")
 EOF
 
+# The TPC-DS probe (br/probe.py) runs a few queries of test_execute_tpcds with the
+# test's own helpers, so it needs the test suite's DuckDB and pandas, at the versions
+# sqlglot's requirements.lock pins (from PyPI).
+RUN pip install --no-cache-dir duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 python-dateutil==4.0.0 \
+    pytz==2026.6 tzdata==2026.6
+
 COPY selector.py /app/selector.py
 COPY br /app/br
 COPY maps /app/maps

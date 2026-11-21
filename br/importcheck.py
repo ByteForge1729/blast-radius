@@ -14,8 +14,11 @@ cost one full `import sqlglot`.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+
+BR_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 CHECKER = r"""
 import importlib, importlib.abc, importlib.util, json, os, sys
@@ -24,6 +27,9 @@ sys.path.insert(0, root)
 import sqlglot  # warm: shared by every forked check
 from sqlglot.dialects.dialect import DIALECT_MODULE_NAMES
 WARM = json.loads(sys.argv[2])
+sys.path.append(sys.argv[3])
+from br import statefp
+PRISTINE = None  # snapshot of the warm, unpatched state, taken once before the first fork
 for _name in WARM + ["sqlglot.dialects." + k for k in DIALECT_MODULE_NAMES]:
     try:
         importlib.import_module(_name)
@@ -68,9 +74,15 @@ def run(request):
     for name in names:
         if not name.startswith("tests"):
             importlib.import_module(name)
+    if request.get("state"):
+        after = statefp.snapshot()
+        changed = {k: statefp.kind_of(PRISTINE, after, k) for k in statefp.diff(PRISTINE[0], after[0])}
+        print("state " + json.dumps(changed), flush=True)
 
 for line in sys.stdin:
     request = json.loads(line)
+    if request.get("state") and PRISTINE is None:
+        PRISTINE = statefp.snapshot()
     pid = os.fork()
     if pid == 0:
         try:
@@ -97,29 +109,46 @@ class ImportChecker:
     def _start(self) -> subprocess.Popen:
         if self.proc is None or self.proc.poll() is not None:
             self.proc = subprocess.Popen(
-                [sys.executable, "-c", CHECKER, self.src_root, json.dumps(self.warm)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                [sys.executable, "-c", CHECKER, self.src_root, json.dumps(self.warm), BR_PARENT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True,
                 env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1"},
             )
         return self.proc
 
     def crashes(self, patched: dict[str, str]) -> bool:
-        """Core modules (loaded by `import sqlglot`, so no dependents entry) re-import everything."""
+        return self.check(patched, state=False)[0]
+
+    def check(self, patched: dict[str, str], state: bool = True) -> tuple[bool, dict[str, str] | None]:
+        """(crashed, changed) for the patched sources.
+
+        `changed` maps every import-time state key ("module::Qual.attr") whose value
+        differs from the unpatched import to "data", "callable" or "class"; None when
+        unknown. Core modules (loaded by `import sqlglot`, so no dependents entry)
+        re-import everything.
+        """
         deps: set[str] = set()
         core = False
         for path in patched:
             if path not in self.dependents:
                 core = True
             deps.update(self.dependents.get(path, ()))
-        request = {"files": patched, "dependents": sorted(deps), "core": core}
+        request = {"files": patched, "dependents": sorted(deps), "core": core, "state": state}
+        changed = None
         try:
             proc = self._start()
             proc.stdin.write(json.dumps(request) + "\n")
             proc.stdin.flush()
-            return proc.stdout.readline().strip() != "ok"
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    raise OSError("checker exited")
+                if line.startswith("state "):
+                    changed = json.loads(line[len("state "):])
+                    continue
+                return line.strip() != "ok", changed
         except (OSError, ValueError):
             self.proc = None
-            return True
+            return True, None
 
     def close(self) -> None:
         if self.proc is not None and self.proc.poll() is None:

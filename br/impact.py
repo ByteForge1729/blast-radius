@@ -20,6 +20,19 @@ from br.equiv import Equivalence, module_key
 from br.readers import ReaderIndex
 
 ALL = None  # sentinel meaning "every test"
+
+
+@dataclass
+class RefineInfo:
+    """What one file's import-time edit needs once the import check reports which
+    import-time state changed: the selection of its in-function lines (run-time
+    coverage only), the names its class/module-level assignments bind, and whether
+    every import-time line was a plain assignment or function code (else no refining)."""
+
+    runtime: set[int] = field(default_factory=set)
+    keys: set[tuple[tuple[str, ...], str]] = field(default_factory=set)
+    functions: set[tuple[str, ...]] = field(default_factory=set)  # edited module/class-level functions
+    refinable: bool = True
 FUNC_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 NAMED_FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef)
 SCOPE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
@@ -57,6 +70,11 @@ def _assigned_names(stmt: ast.AST) -> list[str] | None:
     return names or None
 
 
+
+
+def _module_name(path: str) -> str:
+    name = path[:-3].replace("/", ".")
+    return name[: -len(".__init__")] if name.endswith(".__init__") else name
 
 
 def _qualname(chain: list[ast.AST]) -> tuple[str, ...]:
@@ -129,6 +147,25 @@ class Analyzer:
         self._single = None  # (tree, key) of the patched file when it has one hunk
         self.import_time: dict[str, str] = {}  # path -> patched source, for the import check
         self._touched_import_time = False
+        self.refine_info: dict[str, RefineInfo] = {}
+        self._info = RefineInfo()
+        # for the TPC-DS probe: changed (path, start, end) when every edit is function
+        # code, else None; and the patched text of each Python file
+        self.changed_ranges: list[tuple[str, int, int]] | None = []
+        self.patched_sources: dict[str, str] = {}
+
+    def reset(self) -> None:
+        self.import_time = {}
+        self.refine_info = {}
+        self.changed_ranges = []
+        self.patched_sources = {}
+
+    def _changed(self, path: str, start: int, end: int) -> None:
+        if self.changed_ranges is not None:
+            self.changed_ranges.append((path, start, end))
+
+    def _unprobeable(self) -> None:
+        self.changed_ranges = None
 
     def _import_effect(self, path: str, start: int, end: int) -> set[int] | None:
         """Tests that depend on lines start..end through what they build at import time."""
@@ -166,6 +203,88 @@ class Analyzer:
             for site_path, start, end in sites:
                 readers |= self._range(site_path, start, end)
         return broad & readers
+
+    # ---- refining import-time edits with the import check's state diff ----
+    def refine(self, changed: dict[str, str] | None) -> set[int] | None:
+        """Selection for the files in refine_info, given every import-time state key whose
+        value the patch changed. None means "keep the conservative selection".
+
+        Import-time code can only influence a test through state it leaves behind. When
+        that state is plain data, a test can only observe it by running a statement that
+        reads the attribute: the class's broad set intersected with those readers.
+        """
+        if changed is None or not self.refine_info:
+            return None
+        edited = {
+            f"{_module_name(path)}::{'.'.join(qual)}" for path, info in self.refine_info.items() for qual in info.functions
+        }
+        # an edited function's own key changes with its code: its run-time coverage is
+        # already in `runtime`; any other function, method or class change is unknown
+        if any(kind != "data" and key not in edited for key, kind in changed.items()):
+            return None
+        keys = {key for key, kind in changed.items() if kind == "data"}
+        tests: set[int] = set()
+        for path, info in self.refine_info.items():
+            if not info.refinable:
+                return None
+            module = _module_name(path)
+            keys |= {f"{module}::{'.'.join(qual + (name,))}" for qual, name in info.keys}
+            tests |= info.runtime
+        for key in sorted(keys):
+            part = self._key_tests(key)
+            if part is ALL:
+                return None
+            tests |= part
+        return tests
+
+    def _key_tests(self, key: str) -> set[int] | None:
+        module, _, qual = key.partition("::")
+        path = self._module_path(module)
+        if path is None:
+            return ALL
+        parts = qual.split(".")
+        name = parts[-1]
+        if name.startswith("__") and name.endswith("__"):
+            return ALL  # __annotations__, __init_subclass__ and other protocol hooks
+        readers = self.readers.runtime_reader_lines(name)
+        if len(parts) == 1:
+            # a module global: readers elsewhere may hold it from `from m import NAME`,
+            # so the defining module's own coverage is no bound
+            return self._module(path) if readers is None else self._read(readers)
+        classes = self._class_chain(path, parts[:-1])
+        if len(classes) != len(parts) - 1:
+            return ALL
+        broad = self._broad(path, classes)
+        if broad is not ALL:
+            for depth in range(1, len(classes)):  # users of enclosing classes (Dialect for Dialect.Tokenizer)
+                broad |= self._class_users(path, classes[:depth])
+        if readers is None:
+            return broad
+        return self._read(readers) if broad is ALL else broad & self._read(readers)
+
+    def _read(self, sites) -> set[int]:
+        out: set[int] = set()
+        for site_path, start, end in sites:
+            out |= self._range(site_path, start, end)
+        return out
+
+    def _module_path(self, module: str) -> str | None:
+        base = module.replace(".", "/")
+        for path in (base + ".py", base + "/__init__.py"):
+            if os.path.exists(os.path.join(self.src_root, path)):
+                return path
+        return None
+
+    def _class_chain(self, path: str, names: list[str]) -> list[ast.AST]:
+        tree = self.readers.tree(path)
+        scopes = _scopes(tree)
+        out = []
+        for depth in range(1, len(names) + 1):
+            node = scopes.get(tuple(names[:depth]))
+            if not isinstance(node, ast.ClassDef):
+                return out
+            out.append(node)
+        return out
 
     # ---- coverage helpers -------------------------------------------------
     def _lines(self, path: str, lines) -> set[int]:
@@ -228,24 +347,53 @@ class Analyzer:
         funcs = [i for i, n in enumerate(chain) if isinstance(n, FUNC_TYPES)]
         if not funcs:
             self._touched_import_time = True
+            self._unprobeable()
             broad = self._broad(path, [n for n in chain if isinstance(n, ast.ClassDef)])
             stmts = [n for n in chain if isinstance(n, ast.stmt)]
             stmt = stmts[-1] if stmts else None
+            self._record_keys(chain, stmt, line)
             defining = (path, _start(stmt), stmt.end_lineno) if stmt is not None else (path, 0, -1)
             return self._narrow(path, stmt, defining, broad)
         idx = funcs[-1]
         func = chain[idx]
+        self._info.functions.add(_qualname(chain[: funcs[0] + 1]))
         if isinstance(func, ast.Lambda):
-            return self._range(path, func.lineno, func.end_lineno)
+            self._changed(path, func.lineno, func.end_lineno)
+            tests = self._range(path, func.lineno, func.end_lineno)
+            self._info.runtime |= tests
+            return tests
         if line < func.body[0].lineno:  # decorator, signature, defaults
             self._touched_import_time = True  # evaluated when the def runs, often at import
+            self._info.refinable = False
+            self._unprobeable()
             return self._range(path, _start(func), func.end_lineno)
         stmts = [n for n in chain[idx + 1:] if isinstance(n, ast.stmt)]
         if not stmts:
-            return self._lines(path, {line})
+            self._changed(path, line, line)
+            tests = self._lines(path, {line})
+            self._info.runtime |= tests
+            return tests
         start, end = min(_own_lines(stmts[-1])[0], line), max(_own_lines(stmts[-1])[1], line)
         self._mark_import_time(path, start, end)
-        return _union([self._range(path, start, end), self._import_effect(path, start, end)])
+        self._changed(path, start, end)
+        runtime = self._range(path, start, end)
+        self._info.runtime |= runtime
+        return _union([runtime, self._import_effect(path, start, end)])
+
+    def _record_keys(self, chain: list[ast.AST], stmt: ast.AST | None, line: int) -> None:
+        """Remember the class/module-level names a statement binds, for refine()."""
+        if stmt is None or (isinstance(stmt, ast.ClassDef) and stmt.body and line >= stmt.body[0].lineno):
+            return  # a blank or comment line between statements
+        names = _assigned_names(stmt)
+        if not names:
+            self._info.refinable = False
+            return
+        qual = tuple(n.name for n in chain if isinstance(n, ast.ClassDef))
+        if len(qual) != len([n for n in chain if isinstance(n, SCOPE_TYPES)]):
+            self._info.refinable = False  # a class inside a function: not import-time state
+            return
+        for name in names:
+            self._info.keys.add((qual, name))
 
     # ---- per-insertion analysis on the new tree ---------------------------
     def _insertion(self, path, old_tree, old_lines, new_tree, new_line: int, point: int):
@@ -253,8 +401,10 @@ class Analyzer:
         funcs = [n for n in chain if isinstance(n, FUNC_TYPES)]
         if not funcs:
             self._touched_import_time = True
+            self._unprobeable()
             stmts = [n for n in chain if isinstance(n, ast.stmt)]
             stmt = stmts[-1] if stmts else None
+            self._record_keys(chain, stmt, new_line)
             # a new import-time statement runs where its neighbours ran: use their import groups
             return self._narrow(path, stmt, (path, max(point - 1, 1), point), self._broad_new(path, old_tree, chain))
         named = [n for n in chain if isinstance(n, NAMED_FUNCS)]
@@ -262,11 +412,15 @@ class Analyzer:
             qual = _qualname(chain[: chain.index(named[-1]) + 1])
             old_func = _scopes(old_tree).get(qual)
             if old_func is None:
+                self._info.refinable = False  # a new function or method
+                self._unprobeable()
                 return self._broad_new(path, old_tree, chain)
             if funcs[-1] is named[-1] and new_line < named[-1].body[0].lineno:
+                self._info.refinable = False
+                self._unprobeable()
                 return self._range(path, _start(old_func), old_func.end_lineno)
         neighbours = (_code_line(old_lines, point - 1, -1), _code_line(old_lines, point, 1))
-        return _union(self._old_line(path, old_tree, n) for n in neighbours if n is not None)
+        return _union([self._old_line(path, old_tree, n) for n in neighbours if n is not None])
 
     def _broad_new(self, path: str, old_tree, new_chain) -> set[int] | None:
         classes = [n for n in new_chain if isinstance(n, ast.ClassDef)]
@@ -280,6 +434,8 @@ class Analyzer:
     # ---- file-level entry points ------------------------------------------
     def tests_for(self, fd: FileDiff) -> set[int] | None:
         path = fd.path
+        if not (path.startswith("sqlglot/") and path.endswith(".py")):
+            self._unprobeable()
         if path.startswith("tests/fixtures/"):
             return self._fixture(fd)
         if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
@@ -306,6 +462,8 @@ class Analyzer:
         for prefix, test_file in PACKAGE_WALKERS.items():
             if path.startswith(prefix):
                 extra |= self.maps.tests_by_file.get(test_file, set())
+        if fd.old_path is None or fd.new_path is None or fd.old_path != fd.new_path:
+            self._unprobeable()
         if fd.old_path is None:
             return extra  # a new module nothing imports yet
         if fd.new_path is None or fd.old_path != fd.new_path:
@@ -318,18 +476,22 @@ class Analyzer:
             return ALL
         old_lines = old_text.split("\n")
         old_key = module_key(old_tree, path)
+        self.patched_sources[path] = "\n".join(apply_hunks(old_lines, fd.hunks))
         try:
             full_tree = ast.parse("\n".join(apply_hunks(old_lines, fd.hunks)))
             full_key = module_key(full_tree, path)
         except (SyntaxError, ValueError):
+            self._unprobeable()
             return self._broken(path)
         self._single = (full_tree, full_key) if len(fd.hunks) == 1 else None
         if full_key == old_key or all(self.equiv.same_hunk_text(h, path) for h in fd.hunks):
             return set()
         self._touched_import_time = False
-        tests = _union(self._hunk(path, old_tree, old_key, old_lines, h) for h in fd.hunks)
+        self._info = RefineInfo(runtime=set(extra))
+        tests = _union([self._hunk(path, old_tree, old_key, old_lines, h) for h in fd.hunks])
         if self._touched_import_time and path.startswith("sqlglot/"):
             self.import_time[path] = "\n".join(apply_hunks(old_lines, fd.hunks))
+            self.refine_info[path] = self._info
         return ALL if tests is ALL else tests | extra
 
     def _broken(self, path: str) -> set[int] | None:
@@ -345,6 +507,8 @@ class Analyzer:
             try:
                 new_tree = ast.parse("\n".join(new_lines))
             except (SyntaxError, ValueError):
+                self._info.refinable = False
+                self._unprobeable()
                 return self._broken(path)
             new_key = None
         if self.equiv.same_hunk_text(hunk, path):
