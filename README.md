@@ -75,6 +75,7 @@ Local `score.py` on the organiser's 30 sample commits (simulated seconds, CPU no
 | v3 + class-setup attribution, class-usage tracing | 177.0 | 0 |
 | v4 + `is`/`==` equivalence for None and identity enums | 126.8 | 0 |
 | v5–v7 + constant readers, import-crash check, import-time groups | 118.4 | 0 |
+| v8.1 + import-state diff, TPC-DS probe, running cheap selections | 107.5 | 0 |
 
 Practice board (hidden commits, middle of 3 runs):
 
@@ -84,6 +85,8 @@ Practice board (hidden commits, middle of 3 runs):
 | v4 `b085d47` | 196.9 s | 195.0 s | 1.9 s | 0 |
 | v6 `298a323` | 192.7 s | 184.8 s | 7.9 s | 0 |
 | v7 `9831f14` | 187.3 s | 184.8 s | 2.5 s | 0 |
+| v8 `7e77201` | 184.8 s | 171.2 s | 13.7 s | 0 |
+| v8.1 `7a278a8` (probe and test-run costs priced at board CPU speed) | 179.9 s | 171.6 s | 8.3 s | 0 |
 
 Measuring against the oracle: `tools/waste.py` runs the selected tests of each saved mutant to get its true failing set, and `tools/rescore.py` re-scores the current selector on those (simulated seconds, CPU not included):
 
@@ -93,7 +96,7 @@ Measuring against the oracle: `tools/waste.py` runs the selected tests of each s
 | v7 | 662.0 | 0 |
 | v8 | about 497 | 0 |
 
-Mutation testing (`tools/mutate.py`: random operator, constant, boolean, comment, fixture and class-constant edits, with every unselected test run for real): about 330 mutants so far. The blind spots it found are all fixed: a dialect class constant (v3), an import-time crash in a subclass (v5), and a metaclass/trie edit that runs at import (v6).
+Mutation testing (`tools/mutate.py`: random operator, constant, boolean, comment, fixture and class-constant edits, with every unselected test run for real): about 450 mutants so far (120 in a row on v8.1 with no miss). The blind spots it found are all fixed: a dialect class constant (v3), an import-time crash in a subclass (v5), a metaclass/trie edit that runs at import (v6), and in v8 dataclass field defaults, enum member values, and classes in lazily imported modules missing from the class-usage map.
 
 ## Limitations
 
