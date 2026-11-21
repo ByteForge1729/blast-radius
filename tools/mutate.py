@@ -50,7 +50,37 @@ def _replace_on_line(line: str, old: str, new: str, rng: random.Random) -> str |
     return line[:i] + f" {new} " + line[i + len(old) + 2:]
 
 
+def mutate_class_constant(text: str, rng: random.Random) -> tuple[str, str] | None:
+    """Change a constant assigned in a class body (WEEK_OFFSET = -1, FLAG = True, NAME = "x")."""
+    lines = text.split("\n")
+    sites = []
+    for cls in (n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.ClassDef)):
+        for stmt in cls.body:
+            value = getattr(stmt, "value", None)
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.lineno == stmt.end_lineno:
+                node = value.operand if isinstance(value, ast.UnaryOp) else value
+                if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int, str)):
+                    sites.append((stmt.lineno, node))
+    if not sites:
+        return None
+    lineno, node = rng.choice(sites)
+    line = lines[lineno - 1]
+    seg = line[node.col_offset:node.end_col_offset]
+    if isinstance(node.value, bool):
+        new_seg = str(not node.value)
+    elif isinstance(node.value, int):
+        new_seg = str(node.value + rng.choice([-1, 1]))
+    else:
+        new_seg = repr(node.value + "_X")
+    new = line[:node.col_offset] + new_seg + line[node.end_col_offset:]
+    if new == line or seg == "":
+        return None
+    return "classconst", "\n".join(lines[: lineno - 1] + [new] + lines[lineno:])
+
+
 def mutate_python(text: str, rng: random.Random) -> tuple[str, str] | None:
+    if MODE == "classconst":
+        return mutate_class_constant(text, rng)
     lines = text.split("\n")
     tree = ast.parse(text)
     kind = rng.choice(["op", "op", "op", "const", "bool", "comment", "not"])
@@ -104,8 +134,11 @@ def make_patch(rel: str, old: str, new: str) -> str:
     return f"diff --git a/{rel} b/{rel}\n" + "\n".join(diff) + "\n"
 
 
+MODE = "random"
+
+
 def pick_target(rng: random.Random) -> Path:
-    if rng.random() < 0.3:
+    if MODE != "classconst" and rng.random() < 0.3:
         return rng.choice(sorted((PRISTINE / "tests" / "fixtures").rglob("*.sql")))
     return rng.choice(sorted(p for p in (PRISTINE / "sqlglot").rglob("*.py") if "__pycache__" not in str(p)))
 
@@ -130,7 +163,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--count", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--mode", choices=["random", "classconst"], default="random")
     args = parser.parse_args()
+    global MODE
+    MODE = args.mode
     rng = random.Random(args.seed)
     tests = json.loads((ROOT / "sample" / "tests.json").read_text())["tests"]
     id_of = {t["number"]: t["id"] for t in tests}
@@ -153,7 +189,7 @@ def main() -> None:
             except SyntaxError:
                 continue
         patch = make_patch(rel, old, new)
-        mid = f"s{args.seed}-{done:03d}"
+        mid = f"{'c' if MODE == 'classconst' else 's'}{args.seed}-{done:03d}"
         (OUT / f"{mid}.patch").write_text(patch)
         chosen: set[int] = set()
         for fd in parse_patch(patch):

@@ -12,7 +12,11 @@ import ast
 import os
 from dataclasses import dataclass, field
 
+from br.astutil import chain as _chain
+from br.astutil import own_lines as _own_lines
+from br.astutil import start as _start
 from br.diff import FileDiff, Hunk, apply_hunks
+from br.readers import ReaderIndex
 
 ALL = None  # sentinel meaning "every test"
 FUNC_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
@@ -32,30 +36,25 @@ class Maps:
     tests_by_file: dict[str, set[int]]
     classes: dict[str, list[int]] = field(default_factory=dict)
     enums: frozenset[str] = frozenset()
+    import_lines: dict[str, list[int]] = field(default_factory=dict)
 
 
-def _start(node: ast.AST) -> int:
-    decos = getattr(node, "decorator_list", None) or []
-    return min([node.lineno] + [d.lineno for d in decos])
+ASSIGN_TYPES = (ast.Assign, ast.AnnAssign, ast.AugAssign)
 
 
-def _chain(tree: ast.AST, line: int) -> list[ast.AST]:
-    """Nodes (outermost first) whose line range contains `line`."""
-    chain: list[ast.AST] = []
-    node = tree
-    while True:
-        nxt = None
-        for child in ast.iter_child_nodes(node):
-            if not hasattr(child, "lineno") or getattr(child, "end_lineno", None) is None:
-                continue
-            if _start(child) <= line <= child.end_lineno:
-                nxt = child
-                if isinstance(child, (ast.stmt, ast.Lambda)):
-                    break
-        if nxt is None:
-            return chain
-        chain.append(nxt)
-        node = nxt
+def _assigned_names(stmt: ast.AST) -> list[str] | None:
+    """Plain names a class/module-level assignment binds, or None for anything else."""
+    if not isinstance(stmt, ASSIGN_TYPES):
+        return None
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    names = []
+    for target in targets:
+        if not isinstance(target, ast.Name):
+            return None
+        names.append(target.id)
+    return names or None
+
+
 
 
 def _qualname(chain: list[ast.AST]) -> tuple[str, ...]:
@@ -76,20 +75,6 @@ def _scopes(tree: ast.AST) -> dict[tuple[str, ...], ast.AST]:
 
     walk(tree, ())
     return out
-
-
-def _own_lines(stmt: ast.stmt) -> tuple[int, int]:
-    """Lines a statement executes itself: a simple statement's whole span, or a compound
-    statement's header (condition, iterator, context managers) up to its first child."""
-    children = [
-        child.lineno
-        for field in ("body", "handlers", "orelse", "finalbody", "cases")
-        for child in getattr(stmt, field, None) or []
-        if hasattr(child, "lineno")
-    ]
-    if not children:
-        return _start(stmt), stmt.end_lineno
-    return _start(stmt), max(_start(stmt), min(children) - 1)
 
 
 class _Canonical(ast.NodeTransformer):
@@ -182,6 +167,21 @@ class Analyzer:
     def __init__(self, src_root: str, maps: Maps) -> None:
         self.src_root = src_root
         self.maps = maps
+        self.readers = ReaderIndex(src_root, maps.import_lines)
+
+    def _narrow(self, path: str, stmt: ast.AST | None, defining, broad: set[int] | None):
+        """Intersect a broad selection with the tests that read the assigned names."""
+        names = _assigned_names(stmt) if stmt is not None else None
+        if broad is ALL or not names or not self.maps.import_lines:
+            return broad
+        readers: set[int] = set()
+        for name in names:
+            sites = self.readers.reader_lines(name, defining)
+            if sites is None:
+                return broad
+            for site_path, start, end in sites:
+                readers |= self._range(site_path, start, end)
+        return broad & readers
 
     # ---- coverage helpers -------------------------------------------------
     def _lines(self, path: str, lines) -> set[int]:
@@ -243,7 +243,11 @@ class Analyzer:
         chain = _chain(tree, line)
         funcs = [i for i, n in enumerate(chain) if isinstance(n, FUNC_TYPES)]
         if not funcs:
-            return self._broad(path, [n for n in chain if isinstance(n, ast.ClassDef)])
+            broad = self._broad(path, [n for n in chain if isinstance(n, ast.ClassDef)])
+            stmts = [n for n in chain if isinstance(n, ast.stmt)]
+            stmt = stmts[-1] if stmts else None
+            defining = (path, _start(stmt), stmt.end_lineno) if stmt is not None else (path, 0, -1)
+            return self._narrow(path, stmt, defining, broad)
         idx = funcs[-1]
         func = chain[idx]
         if isinstance(func, ast.Lambda):
@@ -261,7 +265,9 @@ class Analyzer:
         chain = _chain(new_tree, new_line)
         funcs = [n for n in chain if isinstance(n, FUNC_TYPES)]
         if not funcs:
-            return self._broad_new(path, old_tree, chain)
+            stmts = [n for n in chain if isinstance(n, ast.stmt)]
+            stmt = stmts[-1] if stmts else None
+            return self._narrow(path, stmt, (path, 0, -1), self._broad_new(path, old_tree, chain))
         named = [n for n in chain if isinstance(n, NAMED_FUNCS)]
         if named:
             qual = _qualname(chain[: chain.index(named[-1]) + 1])
