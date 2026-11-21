@@ -36,10 +36,14 @@ def load_maps(tests: list[dict]) -> Maps:
     coverage = {path: {int(k): v for k, v in lines.items()} for path, lines in raw.items()}
     with open(MAPS / "fixtures.json", encoding="utf-8") as handle:
         fixtures = json.load(handle)
+    classes: dict[str, list[int]] = {}
+    if (MAPS / "classes.json.gz").exists():
+        with gzip.open(MAPS / "classes.json.gz", "rt", encoding="utf-8") as handle:
+            classes = json.load(handle)
     by_file: dict[str, set[int]] = defaultdict(set)
     for test in tests:
         by_file[test["file"]].add(test["number"])
-    return Maps(coverage=coverage, fixtures=fixtures, tests_by_file=dict(by_file))
+    return Maps(coverage=coverage, fixtures=fixtures, tests_by_file=dict(by_file), classes=classes)
 
 
 def select(analyzer: Analyzer, patch_text: str, everything: set[int]) -> set[int]:

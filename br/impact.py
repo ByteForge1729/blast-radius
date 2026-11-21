@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import ast
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from br.diff import FileDiff, Hunk, apply_hunks
 
@@ -30,6 +30,7 @@ class Maps:
     coverage: dict[str, dict[int, list[int]]]
     fixtures: dict[str, list[int]]
     tests_by_file: dict[str, set[int]]
+    classes: dict[str, list[int]] = field(default_factory=dict)
 
 
 def _start(node: ast.AST) -> int:
@@ -166,6 +167,12 @@ class Analyzer:
         """Tests that can see an import-time change in `path` (inside the innermost class)."""
         if path.startswith("tests/") and path in self.maps.tests_by_file:
             return set(self.maps.tests_by_file[path])
+        if classes and path.startswith("sqlglot/expressions/"):
+            key = f"{path}::{'.'.join(c.name for c in classes)}"
+            used = set(self.maps.classes.get(key, ()))
+            in_class = self._range(path, _start(classes[-1]), classes[-1].end_lineno)
+            if used or in_class:
+                return used | in_class
         module = self._module(path)
         if module is ALL or not classes:
             return module

@@ -69,11 +69,47 @@ class InlineExecutor:
         return False
 
 
+_classes: dict[str, set[str]] = {}
+
+
+def _class_keys(cls) -> list[str]:
+    keys = []
+    for klass in cls.__mro__:
+        module = getattr(klass, "__module__", "") or ""
+        if module.startswith("sqlglot.expressions"):
+            keys.append(module.replace(".", "/") + ".py::" + klass.__qualname__)
+    return keys
+
+
+def _wrap_init(klass) -> None:
+    original = klass.__dict__.get("__init__")
+    if original is None:
+        return
+
+    def __init__(self, *args, **kwargs):
+        if _current:
+            _classes.setdefault(_current[0], set()).update(_class_keys(type(self)))
+        return original(self, *args, **kwargs)
+
+    klass.__init__ = __init__
+
+
+def _record_expression_classes() -> None:
+    """Record which expression classes each test constructs (class-level edits reach them)."""
+    from sqlglot.expressions import core
+
+    for name in ("Expr", "Expression"):
+        if hasattr(core, name):
+            _wrap_init(getattr(core, name))
+
+
 def pytest_configure(config):
     if os.environ.get("INLINE_POOLS"):
         concurrent.futures.ProcessPoolExecutor = InlineExecutor
     builtins.open = _traced_open
     io.open = _traced_open
+    if os.environ.get("TRACE_CLASSES"):
+        _record_expression_classes()
 
 
 def pytest_unconfigure(config):
@@ -126,3 +162,5 @@ def pytest_sessionfinish(session, exitstatus):
     worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
     with _real_open(f"{out}.{worker}.json", "w", encoding="utf-8") as handle:
         json.dump({k: sorted(v) for k, v in _seen.items()}, handle, indent=0, sort_keys=True)
+    with _real_open(f"{out}-classes.{worker}.json", "w", encoding="utf-8") as handle:
+        json.dump({k: sorted(v) for k, v in _classes.items()}, handle, indent=0, sort_keys=True)

@@ -105,8 +105,8 @@ def make_patch(rel: str, old: str, new: str) -> str:
 
 
 def pick_target(rng: random.Random) -> Path:
-    if rng.random() < 0.2:
-        return rng.choice(sorted((PRISTINE / "tests" / "fixtures" / "optimizer").glob("*.sql")))
+    if rng.random() < 0.3:
+        return rng.choice(sorted((PRISTINE / "tests" / "fixtures").rglob("*.sql")))
     return rng.choice(sorted(p for p in (PRISTINE / "sqlglot").rglob("*.py") if "__pycache__" not in str(p)))
 
 

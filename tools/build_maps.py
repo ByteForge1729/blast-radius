@@ -11,6 +11,7 @@ fixtures.json: {"<fixture path>": [test numbers...]}
 """
 
 import glob
+import gzip
 import json
 import os
 import sys
@@ -74,9 +75,18 @@ def build_coverage(repo: str, number_of: dict[str, int]) -> dict:
 
 
 def build_fixtures(trace_dir: str, number_of: dict[str, int]) -> dict:
+    return _invert(glob.glob(os.path.join(trace_dir, "fx.*.json")), number_of)
+
+
+def build_classes(trace_dir: str, number_of: dict[str, int]) -> dict:
+    return _invert(glob.glob(os.path.join(trace_dir, "fx-classes.*.json")), number_of)
+
+
+def _invert(paths: list[str], number_of: dict[str, int]) -> dict:
+    """{context: [keys]} trace files -> {key: [test numbers]}."""
     groups = build_groups(number_of)
     inverse: dict[str, set[int]] = defaultdict(set)
-    for path in glob.glob(os.path.join(trace_dir, "fx.*.json")):
+    for path in paths:
         with open(path, encoding="utf-8") as handle:
             for context, files in json.load(handle).items():
                 tests = context_to_tests(context, number_of, groups)
@@ -95,6 +105,8 @@ def main() -> None:
         json.dump(build_coverage(repo, number_of), handle, separators=(",", ":"))
     with open(os.path.join(out_dir, "fixtures.json"), "w", encoding="utf-8") as handle:
         json.dump(build_fixtures(trace_dir, number_of), handle, indent=1)
+    with gzip.open(os.path.join(out_dir, "classes.json.gz"), "wt", encoding="utf-8") as handle:
+        json.dump(build_classes(trace_dir, number_of), handle, separators=(",", ":"))
 
 
 if __name__ == "__main__":
