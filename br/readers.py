@@ -125,7 +125,7 @@ class ReaderIndex:
         for path, text in self._all_texts().items():
             if name not in text or not word.search(text):
                 continue
-            if quoted.search(text):
+            if quoted.search(text) and self._quoted_read(path, name):
                 return None
             for lineno, line in enumerate(text.split("\n"), start=1):
                 if name not in line or not word.search(line) or line.lstrip().startswith("#"):
@@ -261,6 +261,19 @@ class ReaderIndex:
                     out.append((path, start, end))
                     break
         return out
+
+    def _quoted_read(self, path: str, name: str) -> bool:
+        """True when `name` appears as a string that could name an attribute: anything but
+        a key of a dict literal (SQL function tables such as FUNCTIONS = {"TIME_FORMAT": ...})."""
+        try:
+            tree = self._tree(path)
+        except SyntaxError:
+            return True
+        keys = {id(k) for node in ast.walk(tree) if isinstance(node, ast.Dict) for k in node.keys if k is not None}
+        return any(
+            isinstance(node, ast.Constant) and node.value == name and id(node) not in keys
+            for node in ast.walk(tree)
+        )
 
     def _site(self, path: str, lineno: int, name: str, runtime: bool = False) -> Site | tuple | None:
         """Runtime statement at lineno; () to ignore (plain imports); None if unbounded."""

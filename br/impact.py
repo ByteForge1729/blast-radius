@@ -72,6 +72,28 @@ def _assigned_names(stmt: ast.AST) -> list[str] | None:
 
 
 
+ENUM_BASES = frozenset({"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "AutoName"})
+FIELD_BASES = frozenset({"NamedTuple", "TypedDict"})
+
+
+def _base_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def _has_generic_fields(cls: ast.ClassDef, enums: frozenset[str]) -> bool:
+    """Dataclasses, enums and named tuples read their class-level names generically
+    (generated __init__/__eq__/__repr__, member iteration and value lookup), so a
+    by-name reader search cannot bound who sees a change."""
+    if any("dataclass" in _base_name(d) for d in cls.decorator_list):
+        return True
+    bases = {_base_name(b) for b in cls.bases}
+    return bool(bases & (ENUM_BASES | FIELD_BASES | set(enums)))
+
+
 def _module_name(path: str) -> str:
     name = path[:-3].replace("/", ".")
     return name[: -len(".__init__")] if name.endswith(".__init__") else name
@@ -153,8 +175,10 @@ class Analyzer:
         # code, else None; and the patched text of each Python file
         self.changed_ranges: list[tuple[str, int, int]] | None = []
         self.patched_sources: dict[str, str] = {}
+        self.verifiable = False
 
     def reset(self) -> None:
+        self.verifiable = False  # set by the selector: may the selection be run here?
         self.import_time = {}
         self.refine_info = {}
         self.changed_ranges = []
@@ -198,8 +222,8 @@ class Analyzer:
         readers: set[int] = set()
         for name in names:
             sites = self.readers.reader_lines(name, defining)
-            if sites is None:
-                return unbounded
+            if not sites:
+                return unbounded  # None: unbounded reads; []: read only by library code, if at all
             for site_path, start, end in sites:
                 readers |= self._range(site_path, start, end)
         return broad & readers
@@ -246,7 +270,7 @@ class Analyzer:
         name = parts[-1]
         if name.startswith("__") and name.endswith("__"):
             return ALL  # __annotations__, __init_subclass__ and other protocol hooks
-        readers = self.readers.runtime_reader_lines(name)
+        readers = self.readers.runtime_reader_lines(name) or None  # no reader in our code: unknown
         if len(parts) == 1:
             # a module global: readers elsewhere may hold it from `from m import NAME`,
             # so the defining module's own coverage is no bound
@@ -348,10 +372,13 @@ class Analyzer:
         if not funcs:
             self._touched_import_time = True
             self._unprobeable()
-            broad = self._broad(path, [n for n in chain if isinstance(n, ast.ClassDef)])
+            classes = [n for n in chain if isinstance(n, ast.ClassDef)]
+            broad = self._broad(path, classes)
             stmts = [n for n in chain if isinstance(n, ast.stmt)]
             stmt = stmts[-1] if stmts else None
             self._record_keys(chain, stmt, line)
+            if classes and _has_generic_fields(classes[-1], self.maps.enums):
+                return broad
             defining = (path, _start(stmt), stmt.end_lineno) if stmt is not None else (path, 0, -1)
             return self._narrow(path, stmt, defining, broad)
         idx = funcs[-1]
@@ -388,7 +415,11 @@ class Analyzer:
         if not names:
             self._info.refinable = False
             return
-        qual = tuple(n.name for n in chain if isinstance(n, ast.ClassDef))
+        classes = [n for n in chain if isinstance(n, ast.ClassDef)]
+        qual = tuple(n.name for n in classes)
+        if classes and _has_generic_fields(classes[-1], self.maps.enums):
+            self._info.refinable = False
+            return
         if len(qual) != len([n for n in chain if isinstance(n, SCOPE_TYPES)]):
             self._info.refinable = False  # a class inside a function: not import-time state
             return
@@ -405,6 +436,9 @@ class Analyzer:
             stmts = [n for n in chain if isinstance(n, ast.stmt)]
             stmt = stmts[-1] if stmts else None
             self._record_keys(chain, stmt, new_line)
+            classes = [n for n in chain if isinstance(n, ast.ClassDef)]
+            if classes and _has_generic_fields(classes[-1], self.maps.enums):
+                return self._broad_new(path, old_tree, chain)
             # a new import-time statement runs where its neighbours ran: use their import groups
             return self._narrow(path, stmt, (path, max(point - 1, 1), point), self._broad_new(path, old_tree, chain))
         named = [n for n in chain if isinstance(n, NAMED_FUNCS)]

@@ -69,6 +69,38 @@ def load_maps(tests: list[dict]) -> Maps:
 
 
 MAX_PROBE_QUERIES = 30
+VERIFY_MAX_SECONDS = 2.0  # recorded seconds of a selection we run ourselves to keep only its failures
+VERIFY_TIMEOUT_FACTOR = 5.0
+
+
+class Verifier:
+    """Runs a small selection on the patched sources and keeps only the tests that fail.
+
+    Worth it when the selection is cheap: if nothing fails the commit costs 0 instead of
+    2 s for a worker plus the tests. The run happens in a fresh import of everything
+    (no state from the warm process), with process pools run inline and subprocesses
+    refused, so a test that would see unpatched code errors out and stays selected.
+    """
+
+    def __init__(self, tests: list[dict], checker: ImportChecker) -> None:
+        self.ids = {t["number"]: t["id"] for t in tests}
+        self.seconds = {t["number"]: t["seconds"] for t in tests}
+        self.numbers = {t["id"]: t["number"] for t in tests}
+        self.checker = checker
+
+    def verify(self, analyzer: Analyzer, chosen: set[int]) -> set[int]:
+        cost = sum(self.seconds[n] for n in chosen)
+        if not chosen or cost > VERIFY_MAX_SECONDS or not analyzer.verifiable:
+            return chosen
+        failed = self.checker.run_tests(
+            analyzer.patched_sources, [self.ids[n] for n in sorted(chosen)], VERIFY_TIMEOUT_FACTOR * cost + 5
+        )
+        if failed is None or not failed <= set(self.numbers):
+            log("  verify: run did not finish cleanly, keeping the selection")
+            return chosen
+        kept = {self.numbers[i] for i in failed} & chosen
+        log(f"  verify: {len(kept)} of {len(chosen)} selected tests fail")
+        return kept
 
 
 class TpcdsProbe:
@@ -104,10 +136,12 @@ class TpcdsProbe:
 
 
 def select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: list[str],
-           checker: ImportChecker, tpcds: TpcdsProbe | None = None) -> set[int]:
+           checker: ImportChecker, tpcds: TpcdsProbe | None = None, verifier: Verifier | None = None) -> set[int]:
     chosen = _select(analyzer, patch_text, everything, modules, checker)
     if tpcds is not None and chosen != everything:
         chosen = tpcds.prune(analyzer, chosen)
+    if verifier is not None and chosen != everything:
+        chosen = verifier.verify(analyzer, chosen)
     return chosen
 
 
@@ -115,8 +149,14 @@ def _select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: 
             checker: ImportChecker) -> set[int]:
     analyzer.reset()
     per_file: list[tuple[str, set[int] | None]] = []
-    for file_diff in parse_patch(patch_text):
+    diffs = parse_patch(patch_text)
+    # running tests here sees only patched .py modules: no fixture, data or file renames
+    analyzer.verifiable = bool(diffs) and all(
+        fd.path.endswith(".py") and fd.old_path == fd.new_path and not fd.binary for fd in diffs
+    )
+    for file_diff in diffs:
         per_file.append((file_diff.path, analyzer.tests_for(file_diff)))
+    analyzer.verifiable = analyzer.verifiable and all(fd.path in analyzer.patched_sources for fd in diffs)
     conservative = _union(got for _, got in per_file)
     if not analyzer.import_time:
         return set(everything) if conservative is ALL else conservative & everything
@@ -161,10 +201,11 @@ def main() -> None:
     modules = collection_modules()
     checker = ImportChecker(SRC, modules, analyzer.maps.import_groups.get("dependents", {}))
     tpcds = TpcdsProbe(tests, SRC)
+    verifier = Verifier(tests, checker)
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
             chosen = select(analyzer, patch.read_text(encoding="utf-8", errors="replace"), everything, modules,
-                            checker, tpcds)
+                            checker, tpcds, verifier)
         except Exception as error:  # noqa: BLE001 - a crash must never cost a miss
             log(f"{patch.stem}: fallback to all tests ({type(error).__name__}: {error})")
             chosen = set(everything)
