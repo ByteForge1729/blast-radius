@@ -57,14 +57,24 @@ python tools/build_maps.py path/to/sqlglot sample/tests.json ../trace maps && gz
 
 ## Results
 
-| Set | Simulated seconds | Misses |
+Local `score.py` on the organiser's 30 sample commits (simulated seconds, CPU not included):
+
+| Version | Simulated seconds | Misses |
 | --- | --- | --- |
-| Starter (run everything on 3 workers), 30 sample commits | 1210.5 | 0 |
-| This selector, 30 sample commits (local `score.py`) | 178.3 | 0 |
+| Starter (run everything on 3 workers) | 1210.5 | 0 |
+| Oracle (exactly the failing tests, best packing) | 94.4 | 0 |
+| v1 line coverage + AST no-op detection | 178.3 | 0 |
+| v3 + class-setup attribution, class-usage tracing | 177.0 | 0 |
+| v4 + `is`/`==` equivalence for None and identity enums | 126.8 | 0 |
+
+Practice board (hidden commits, middle of 3 runs): v1 scored 497.0 s (195.6 s plus one missed commit; 1.4 s CPU).
+
+Mutation testing (`tools/mutate.py`, random operator, constant, boolean, comment and fixture edits, every unselected test run for real): 160 mutants so far; the one miss found (a dialect class constant) is fixed in v3.
 
 ## Limitations
 
-- Coverage is line-level. A change whose effect reaches a test only through data that is never executed as a line (for example, some class-level tables) relies on the broader fallback.
+- Coverage is line-level. Class-level edits rely on class-usage tracing (which tests constructed the class or a subclass); a class whose attributes are read without ever being instantiated falls back to module or dialect-family coverage.
+- The `is`/`==` equivalence assumes no object with an unusual `__eq__` reaches the changed comparison; only the executor's sort wrapper is known to have one, and its file is excluded.
 - Maps were built on macOS arm64 with Python 3.13. The scorer runs linux/amd64, where a few platform-dependent paths might differ.
 - The Docker image has not been built locally (no Docker on the dev machine).
 
