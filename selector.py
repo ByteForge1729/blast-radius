@@ -69,14 +69,15 @@ def load_maps(tests: list[dict]) -> Maps:
     )
 
 
-MAX_PROBE_QUERIES = 30
+REFINE_MIN_SECONDS = 3.0  # board cost below which the import-state diff cannot pay for itself
+MAX_PROBE_QUERIES = 15  # board CPU ~2.2 s + 0.73 s per query against 21.5 s saved when it passes
 VERIFY_MAX_SECONDS = 3.0  # recorded seconds of a selection we run ourselves to keep only its failures
 VERIFY_TIMEOUT_FACTOR = 5.0
-VERIFY_CPU_FACTOR = 1.2  # our run's CPU per recorded test second, with margin
-VERIFY_FIXED_SECONDS = 0.1  # fork and a fresh import of sqlglot
+VERIFY_CPU_FACTOR = 1.2  # board CPU per recorded test second (the board machine is ~2.2x slower than dev)
+VERIFY_FIXED_SECONDS = 0.25  # fork and a fresh import of sqlglot, on the board
 VERIFY_WORTH = 0.5  # run when the estimate is below this share of the selection's board cost
 # setUpClass work a run pays once per test class (loading TPC tables, DuckDB, pandas)
-SETUP_SECONDS = {"tests/test_executor.py::TestExecutor": 1.0, "tests/test_optimizer.py::TestOptimizer": 0.3}
+SETUP_SECONDS = {"tests/test_executor.py::TestExecutor": 2.2, "tests/test_optimizer.py::TestOptimizer": 0.7}
 WORKER_SECONDS = 2.0
 
 
@@ -155,7 +156,8 @@ class TpcdsProbe:
 
 def select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: list[str],
            checker: ImportChecker, tpcds: TpcdsProbe | None = None, verifier: Verifier | None = None) -> set[int]:
-    chosen = _select(analyzer, patch_text, everything, modules, checker)
+    worth = (lambda tests: verifier.board_cost(tests) > REFINE_MIN_SECONDS) if verifier is not None else None
+    chosen = _select(analyzer, patch_text, everything, modules, checker, worth)
     if tpcds is not None and chosen != everything:
         chosen = tpcds.prune(analyzer, chosen)
     if verifier is not None and chosen != everything:
@@ -164,7 +166,7 @@ def select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: l
 
 
 def _select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: list[str],
-            checker: ImportChecker) -> set[int]:
+            checker: ImportChecker, worth_refining=None) -> set[int]:
     analyzer.reset()
     per_file: list[tuple[str, set[int] | None]] = []
     diffs = parse_patch(patch_text)
@@ -178,7 +180,9 @@ def _select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: 
     conservative = _union(got for _, got in per_file)
     if not analyzer.import_time:
         return set(everything) if conservative is ALL else conservative & everything
-    crashed, changed = checker.check(analyzer.import_time)
+    # the state snapshot costs ~0.25 s of board CPU: skip it when the selection is already cheap
+    state = conservative is ALL or worth_refining is None or worth_refining(conservative & everything)
+    crashed, changed = checker.check(analyzer.import_time, state=state)
     if crashed:
         log("  import-time crash detected: selecting every test")
         return set(everything)
@@ -218,8 +222,8 @@ def main() -> None:
     analyzer = Analyzer(SRC, load_maps(tests))
     modules = collection_modules()
     checker = ImportChecker(SRC, modules, analyzer.maps.import_groups.get("dependents", {}))
-    tpcds = TpcdsProbe(tests, SRC)
-    verifier = Verifier(tests, checker)
+    tpcds = None if os.environ.get("BR_NO_PROBE") else TpcdsProbe(tests, SRC)
+    verifier = None if os.environ.get("BR_NO_VERIFY") else Verifier(tests, checker)
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
             chosen = select(analyzer, patch.read_text(encoding="utf-8", errors="replace"), everything, modules,
