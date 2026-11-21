@@ -72,19 +72,51 @@ class InlineExecutor:
 def pytest_configure(config):
     if os.environ.get("INLINE_POOLS"):
         concurrent.futures.ProcessPoolExecutor = InlineExecutor
+    builtins.open = _traced_open
+    io.open = _traced_open
+
+
+def pytest_unconfigure(config):
+    builtins.open = _real_open
+    io.open = _real_io_open
 
 
 @pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_protocol(item, nextitem):
-    _current[:] = [item.nodeid]
-    builtins.open = _traced_open
-    io.open = _traced_open
-    try:
+def pytest_make_collect_report(collector):
+    """Files a test module opens while importing belong to every test in that module."""
+    if isinstance(collector, pytest.Module):
+        _current[:] = [f"collect:{collector.nodeid}"]
+        try:
+            yield
+        finally:
+            _current.clear()
+    else:
         yield
-    finally:
-        builtins.open = _real_open
-        io.open = _real_io_open
-        _current.clear()
+
+
+def _phase(item, phase: str):
+    _current[:] = [f"{item.nodeid}|{phase}"]
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_setup(item):
+    _phase(item, "setup")
+    yield
+    _current.clear()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    _phase(item, "run")
+    yield
+    _current.clear()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    _phase(item, "teardown")
+    yield
+    _current.clear()
 
 
 def pytest_sessionfinish(session, exitstatus):

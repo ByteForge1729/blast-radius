@@ -19,13 +19,37 @@ from collections import defaultdict
 from coverage import CoverageData
 
 
-def context_to_nodeid(context: str) -> str:
-    return context.rsplit("|", 1)[0]
+def context_to_tests(context: str, number_of: dict[str, int], groups: dict[str, set[int]]) -> set[int]:
+    """Tests a coverage/trace context belongs to.
+
+    "<nodeid>|run"            -> that test
+    "<nodeid>|setup|teardown" -> every test in its class (setUpClass runs once per worker)
+    "collect:<file>"          -> every test in that file (module import)
+    """
+    if context.startswith("collect:"):
+        return groups.get(context[len("collect:"):], set())
+    nodeid, _, phase = context.rpartition("|")
+    if not nodeid:
+        nodeid, phase = context, "run"
+    if phase == "run":
+        return {number_of[nodeid]} if nodeid in number_of else set()
+    return groups.get(nodeid.rsplit("::", 1)[0], set()) | ({number_of[nodeid]} if nodeid in number_of else set())
+
+
+def build_groups(number_of: dict[str, int]) -> dict[str, set[int]]:
+    """Map every file and class prefix of a node id to the tests under it."""
+    groups: dict[str, set[int]] = defaultdict(set)
+    for nodeid, number in number_of.items():
+        parts = nodeid.split("::")
+        for depth in range(1, len(parts)):
+            groups["::".join(parts[:depth])].add(number)
+    return groups
 
 
 def build_coverage(repo: str, number_of: dict[str, int]) -> dict:
     data = CoverageData(basename=os.path.join(repo, ".coverage"))
     data.read()
+    groups = build_groups(number_of)
     result: dict[str, dict[str, list[int]]] = {}
     unknown: set[str] = set()
     for path in data.measured_files():
@@ -33,15 +57,14 @@ def build_coverage(repo: str, number_of: dict[str, int]) -> dict:
         by_line = data.contexts_by_lineno(path)
         lines: dict[str, list[int]] = {}
         for line, contexts in by_line.items():
-            nums = set()
+            nums: set[int] = set()
             for ctx in contexts:
                 if not ctx:
                     continue
-                nodeid = context_to_nodeid(ctx)
-                if nodeid in number_of:
-                    nums.add(number_of[nodeid])
-                else:
-                    unknown.add(nodeid)
+                got = context_to_tests(ctx, number_of, groups)
+                if not got:
+                    unknown.add(ctx)
+                nums |= got
             if nums:
                 lines[str(line)] = sorted(nums)
         if lines:
@@ -51,13 +74,14 @@ def build_coverage(repo: str, number_of: dict[str, int]) -> dict:
 
 
 def build_fixtures(trace_dir: str, number_of: dict[str, int]) -> dict:
+    groups = build_groups(number_of)
     inverse: dict[str, set[int]] = defaultdict(set)
     for path in glob.glob(os.path.join(trace_dir, "fx.*.json")):
         with open(path, encoding="utf-8") as handle:
-            for nodeid, files in json.load(handle).items():
-                if nodeid in number_of:
-                    for f in files:
-                        inverse[f].add(number_of[nodeid])
+            for context, files in json.load(handle).items():
+                tests = context_to_tests(context, number_of, groups)
+                for f in files:
+                    inverse[f] |= tests
     return {k: sorted(v) for k, v in sorted(inverse.items())}
 
 
