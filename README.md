@@ -66,10 +66,18 @@ Local `score.py` on the organiser's 30 sample commits (simulated seconds, CPU no
 | v1 line coverage + AST no-op detection | 178.3 | 0 |
 | v3 + class-setup attribution, class-usage tracing | 177.0 | 0 |
 | v4 + `is`/`==` equivalence for None and identity enums | 126.8 | 0 |
+| v5–v7 + constant readers, import-crash check, import-time groups | 118.4 | 0 |
 
-Practice board (hidden commits, middle of 3 runs): v1 scored 497.0 s (195.6 s plus one missed commit; 1.4 s CPU).
+Practice board (hidden commits, middle of 3 runs):
 
-Mutation testing (`tools/mutate.py`, random operator, constant, boolean, comment and fixture edits, every unselected test run for real): 120 mutants so far; the one miss found (a dialect class constant) is fixed in v3.
+| Version | Score | Simulated | CPU | Missed commits |
+| --- | --- | --- | --- | --- |
+| v1 `c46568b` | 497.0 s | 495.6 s | 1.4 s | 1 |
+| v4 `b085d47` | 196.9 s | 195.0 s | 1.9 s | 0 |
+| v6 `298a323` | 192.7 s | 184.8 s | 7.9 s | 0 |
+| v7 `9831f14` | 187.3 s | 184.8 s | 2.5 s | 0 |
+
+Mutation testing (`tools/mutate.py`: random operator, constant, boolean, comment, fixture and class-constant edits, with every unselected test run for real): about 330 mutants so far. The blind spots it found are all fixed: a dialect class constant (v3), an import-time crash in a subclass (v5), and a metaclass/trie edit that runs at import (v6).
 
 ## Limitations
 
