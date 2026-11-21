@@ -18,7 +18,7 @@ EOF
 COPY selector.py /app/selector.py
 COPY br /app/br
 COPY maps /app/maps
-RUN python -m compileall -q /app && chmod -R a+rX /app /opt/sqlglot
+RUN python -m compileall -q /app /opt/sqlglot/sqlglot && chmod -R a+rX /app /opt/sqlglot
 
 ENV BR_SQLGLOT=/opt/sqlglot
 CMD ["python", "/app/selector.py"]

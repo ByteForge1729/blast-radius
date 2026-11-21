@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE))
 
 from br.diff import parse_patch  # noqa: E402
 from br.impact import ALL, Analyzer, Maps  # noqa: E402
+from br.importcheck import import_crashes  # noqa: E402
 from br.schedule import split  # noqa: E402
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -53,14 +54,30 @@ def load_maps(tests: list[dict]) -> Maps:
                 import_lines=import_lines)
 
 
-def select(analyzer: Analyzer, patch_text: str, everything: set[int]) -> set[int]:
+def select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: list[str]) -> set[int]:
     chosen: set[int] = set()
+    analyzer.import_time = {}
     for file_diff in parse_patch(patch_text):
         got = analyzer.tests_for(file_diff)
         if got is ALL:
             return set(everything)
         chosen |= got
+    if analyzer.import_time and import_crashes(SRC, analyzer.import_time, modules):
+        log("  import-time crash detected: selecting every test")
+        return set(everything)
     return chosen & everything
+
+
+def collection_modules() -> list[str]:
+    """Module names test files import at collection (from maps/collect_imports.json)."""
+    path = MAPS / "collect_imports.json"
+    if not path.exists():
+        return []
+    names = []
+    for rel in json.loads(path.read_text()):
+        name = rel[:-3].replace("/", ".")
+        names.append(name[: -len(".__init__")] if name.endswith(".__init__") else name)
+    return names
 
 
 def main() -> None:
@@ -68,9 +85,10 @@ def main() -> None:
     ms_of = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     everything = set(ms_of)
     analyzer = Analyzer(SRC, load_maps(tests))
+    modules = collection_modules()
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
-            chosen = select(analyzer, patch.read_text(encoding="utf-8", errors="replace"), everything)
+            chosen = select(analyzer, patch.read_text(encoding="utf-8", errors="replace"), everything, modules)
         except Exception as error:  # noqa: BLE001 - a crash must never cost a miss
             log(f"{patch.stem}: fallback to all tests ({type(error).__name__}: {error})")
             chosen = set(everything)

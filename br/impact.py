@@ -168,6 +168,13 @@ class Analyzer:
         self.src_root = src_root
         self.maps = maps
         self.readers = ReaderIndex(src_root, maps.import_lines)
+        self.import_time: dict[str, str] = {}  # path -> patched source, for the import check
+        self._touched_import_time = False
+
+    def _mark_import_time(self, path: str, start: int, end: int) -> None:
+        lines = self.maps.import_lines.get(path, ())
+        if any(start <= line <= end for line in lines):
+            self._touched_import_time = True
 
     def _narrow(self, path: str, stmt: ast.AST | None, defining, broad: set[int] | None):
         """Intersect a broad selection with the tests that read the assigned names."""
@@ -243,6 +250,7 @@ class Analyzer:
         chain = _chain(tree, line)
         funcs = [i for i, n in enumerate(chain) if isinstance(n, FUNC_TYPES)]
         if not funcs:
+            self._touched_import_time = True
             broad = self._broad(path, [n for n in chain if isinstance(n, ast.ClassDef)])
             stmts = [n for n in chain if isinstance(n, ast.stmt)]
             stmt = stmts[-1] if stmts else None
@@ -253,11 +261,13 @@ class Analyzer:
         if isinstance(func, ast.Lambda):
             return self._range(path, func.lineno, func.end_lineno)
         if line < func.body[0].lineno:  # decorator, signature, defaults
+            self._touched_import_time = True  # evaluated when the def runs, often at import
             return self._range(path, _start(func), func.end_lineno)
         stmts = [n for n in chain[idx + 1:] if isinstance(n, ast.stmt)]
         if not stmts:
             return self._lines(path, {line})
         start, end = _own_lines(stmts[-1])
+        self._mark_import_time(path, min(start, line), max(end, line))
         return self._range(path, min(start, line), max(end, line))
 
     # ---- per-insertion analysis on the new tree ---------------------------
@@ -265,6 +275,7 @@ class Analyzer:
         chain = _chain(new_tree, new_line)
         funcs = [n for n in chain if isinstance(n, FUNC_TYPES)]
         if not funcs:
+            self._touched_import_time = True
             stmts = [n for n in chain if isinstance(n, ast.stmt)]
             stmt = stmts[-1] if stmts else None
             return self._narrow(path, stmt, (path, 0, -1), self._broad_new(path, old_tree, chain))
@@ -336,7 +347,10 @@ class Analyzer:
             return self._broken(path)
         if full_dump == old_dump:
             return set()
+        self._touched_import_time = False
         tests = _union(self._hunk(path, old_tree, old_dump, old_lines, h) for h in fd.hunks)
+        if self._touched_import_time and path.startswith("sqlglot/"):
+            self.import_time[path] = "\n".join(apply_hunks(old_lines, fd.hunks))
         return ALL if tests is ALL else tests | extra
 
     def _broken(self, path: str) -> set[int] | None:
