@@ -28,7 +28,7 @@ os.environ.setdefault("BR_SQLGLOT", str(ROOT / "work" / "sqlglot"))
 
 from br.impact import Analyzer  # noqa: E402
 from br.importcheck import ImportChecker  # noqa: E402
-from selector import TpcdsProbe, collection_modules, load_maps, select  # noqa: E402
+from selector import TpcdsProbe, Verifier, collection_modules, load_maps, select  # noqa: E402
 
 PRISTINE = ROOT / "work" / "sqlglot"
 SCRATCH = Path(os.environ.get("BR_SCRATCH", ROOT / "work" / "mutsrc"))
@@ -177,6 +177,7 @@ def main() -> None:
     modules = collection_modules()
     checker = ImportChecker(str(PRISTINE), modules, analyzer.maps.import_groups.get("dependents", {}))
     tpcds = TpcdsProbe(tests, str(PRISTINE))
+    verifier = Verifier(tests, checker)
     OUT.mkdir(parents=True, exist_ok=True)
     if not SCRATCH.exists():
         shutil.copytree(PRISTINE, SCRATCH, ignore=shutil.ignore_patterns(".git", ".coverage*", "__pycache__"))
@@ -197,7 +198,7 @@ def main() -> None:
         patch = make_patch(rel, old, new)
         mid = f"{'c' if MODE == 'classconst' else 's'}{args.seed}-{done:03d}{TAG}"
         (OUT / f"{mid}.patch").write_text(patch)
-        chosen = select(analyzer, patch, set(id_of), modules, checker, tpcds)
+        chosen = select(analyzer, patch, set(id_of), modules, checker, tpcds, verifier)
         scratch_file = SCRATCH / rel
         scratch_file.write_text(new, encoding="utf-8")
         try:

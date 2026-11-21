@@ -116,13 +116,23 @@ def _wrap_init(klass) -> None:
 def _record_class_usage() -> None:
     """Record which sqlglot classes each test constructs, so class-level edits reach them.
 
-    Wraps every __init__ defined by a class in an already-imported sqlglot module;
-    subclasses imported later (lazy dialects) inherit the wrapped __init__.
+    Imports every sqlglot module first, then wraps every __init__ a sqlglot class
+    defines, so lazily imported modules (lineage, optimizer, executor, dialects) and
+    their own constructors are traced too.
     """
+    import importlib
     import inspect
+    import pkgutil
 
-    import sqlglot  # noqa: F401 - loads the core modules
-    from sqlglot.dialects.dialect import Dialect  # noqa: F401
+    import sqlglot
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        if info.name.endswith("__main__"):
+            continue
+        try:
+            importlib.import_module(info.name)
+        except Exception:  # noqa: BLE001 - optional extras (e.g. mypyc cores) may be missing
+            pass
 
     for name, module in list(sys.modules.items()):
         if not name.startswith("sqlglot") or module is None:

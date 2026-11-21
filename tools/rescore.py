@@ -23,7 +23,7 @@ from waste import board_cost  # noqa: E402
 from br.impact import Analyzer  # noqa: E402
 from br.importcheck import ImportChecker  # noqa: E402
 from br.schedule import split  # noqa: E402
-from selector import TpcdsProbe, collection_modules, load_maps, select  # noqa: E402
+from selector import TpcdsProbe, Verifier, collection_modules, load_maps, select  # noqa: E402
 
 MISS_SECONDS = 300.0
 VERBOSE = "-v" in sys.argv
@@ -40,11 +40,12 @@ def main() -> None:
     modules = collection_modules()
     checker = ImportChecker(str(PRISTINE), modules, analyzer.maps.import_groups.get("dependents", {}))
     tpcds = None if "--no-probe" in sys.argv else TpcdsProbe(tests, str(PRISTINE))
+    verifier = None if "--no-verify" in sys.argv else Verifier(tests, checker)
     totals: dict[str, list[float]] = defaultdict(lambda: [0, 0.0, 0.0, 0.0])
     misses = []
     for line in (OUT / "waste.jsonl").open():
         row = json.loads(line)
-        chosen = select(analyzer, (OUT / f"{row['id']}.patch").read_text(), set(seconds), modules, checker, tpcds)
+        chosen = select(analyzer, (OUT / f"{row['id']}.patch").read_text(), set(seconds), modules, checker, tpcds, verifier)
         cost = board_cost(split(sorted(chosen), ms), seconds)
         # an unparsed entry is a whole file that failed to import: all its tests fail
         failing = set(row["failing"]).union(*(by_file.get(f, {-1}) for f in set(row["unparsed"])))
