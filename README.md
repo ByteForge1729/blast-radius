@@ -16,10 +16,14 @@ Each input is a patch against sqlglot at commit `eb11aec4`. The selector prints,
 2. **Per patch, at run time** (`br/`):
    - Each hunk is applied on its own and both versions are parsed. If the syntax tree is unchanged (comments, blank lines), the hunk is ignored.
    - A changed statement inside a function or lambda selects the tests that executed any line of that statement.
-   - Import-time changes (class or module level, new methods, signatures) fall back to the tests that touched that class, module or dialect family.
+   - Import-time changes (class or module level, new methods, signatures) first fall back to the tests that touched that class, module or dialect family.
+   - The import check (below) then compares every class and module attribute after the patched import with the unpatched import. When only plain data changed, the selection becomes the tests that read a changed attribute at run time, within that class's users. A constant passed into a constructor keyword and stored as `self.<kw>` is followed to the code that reads the stored attribute.
    - Fixture edits select the tests that read the fixture. SQL comment-only fixture edits select nothing.
    - Syntax errors, deleted modules and unknown files select every test. Any internal error falls back to every test.
-3. **Scheduling** (`br/schedule.py`): longest-first packing, trying 1 to 8 workers and keeping the cheapest (busiest worker + 2 s per worker).
+3. **Running tests while deciding** (allowed by the rules, CPU is charged):
+   - A selection of at most 2 recorded seconds is run on the patched code in a fresh import (process pools inline, subprocesses refused), and only the tests that fail are kept. A change no test catches then costs 0 instead of 2 s or more.
+   - `test_execute_tpcds` (21.5 s) is decided by running only the TPC-DS queries whose per-query coverage (`maps/tpcds_queries.json.gz`) touches a function-body change.
+4. **Scheduling** (`br/schedule.py`): longest-first packing, trying 1 to 8 workers and keeping the cheapest (busiest worker + 2 s per worker).
 
 ## Layout
 
@@ -29,6 +33,10 @@ Each input is a patch against sqlglot at commit `eb11aec4`. The selector prints,
 | `br/diff.py` | Unified diff parsing and hunk application |
 | `br/impact.py` | Patch to affected tests |
 | `br/schedule.py` | Worker split |
+| `br/importcheck.py` | Forked import check: crashes, import-time state diff, running small selections |
+| `br/statefp.py` | Content fingerprints of class and module attributes |
+| `br/readers.py` | Statements that read a class or module name |
+| `br/probe.py` | TPC-DS query probe for `test_execute_tpcds` |
 | `maps/` | Coverage and fixture maps from the pinned commit |
 | `tools/` | Scripts that rebuild the maps |
 | `sample/`, `score.py`, `SCORING.md` | Organiser's sample set and scorer |
@@ -77,6 +85,14 @@ Practice board (hidden commits, middle of 3 runs):
 | v6 `298a323` | 192.7 s | 184.8 s | 7.9 s | 0 |
 | v7 `9831f14` | 187.3 s | 184.8 s | 2.5 s | 0 |
 
+Measuring against the oracle: `tools/waste.py` runs the selected tests of each saved mutant to get its true failing set, and `tools/rescore.py` re-scores the current selector on those (simulated seconds, CPU not included):
+
+| Version | 104 mutants (mostly class constants) | Misses |
+| --- | --- | --- |
+| Oracle | 117.7 | 0 |
+| v7 | 662.0 | 0 |
+| v8 | about 497 | 0 |
+
 Mutation testing (`tools/mutate.py`: random operator, constant, boolean, comment, fixture and class-constant edits, with every unselected test run for real): about 330 mutants so far. The blind spots it found are all fixed: a dialect class constant (v3), an import-time crash in a subclass (v5), and a metaclass/trie edit that runs at import (v6).
 
 ## Limitations
@@ -84,7 +100,9 @@ Mutation testing (`tools/mutate.py`: random operator, constant, boolean, comment
 - Coverage is line-level. Class-level edits rely on class-usage tracing (which tests constructed the class or a subclass); a class whose attributes are read without ever being instantiated falls back to module or dialect-family coverage.
 - The `is`/`==` equivalence assumes no object with an unusual `__eq__` reaches the changed comparison; only the executor's sort wrapper is known to have one, and its file is excluded.
 - Maps were built on macOS arm64 with Python 3.13. The scorer runs linux/amd64, where a few platform-dependent paths might differ.
-- The Docker image has not been built locally (no Docker on the dev machine).
+- Running tests while deciding assumes they behave the same in one process as under pytest workers. Process pools run inline (with pickling), which differs from a spawned worker only in process-global state.
+- The state diff sees state reachable from sqlglot's module globals. Effects stored elsewhere (other libraries, objects only reachable through caches) are invisible to it.
+- Hot-path flags (read on almost every parse) still select most of their dialect's tests, because line coverage cannot see which branch a test took.
 
 ## License
 

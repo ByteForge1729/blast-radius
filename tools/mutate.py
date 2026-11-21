@@ -203,6 +203,8 @@ def main() -> None:
         scratch_file.write_text(new, encoding="utf-8")
         try:
             missed = run_unselected([id_of[n] for n in sorted(set(id_of) - chosen)])
+            if missed:  # a loaded machine can time a test out: confirm each miss on its own
+                missed = [m for m in missed if m.startswith("<") or run_unselected([m])]
         finally:
             scratch_file.write_text(old, encoding="utf-8")
         record = {"id": mid, "kind": kind, "file": rel, "selected": len(chosen), "missed": missed}

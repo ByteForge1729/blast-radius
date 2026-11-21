@@ -11,6 +11,7 @@ import gzip
 import json
 import os
 import pickle
+import resource
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -69,8 +70,14 @@ def load_maps(tests: list[dict]) -> Maps:
 
 
 MAX_PROBE_QUERIES = 30
-VERIFY_MAX_SECONDS = 2.0  # recorded seconds of a selection we run ourselves to keep only its failures
+VERIFY_MAX_SECONDS = 3.0  # recorded seconds of a selection we run ourselves to keep only its failures
 VERIFY_TIMEOUT_FACTOR = 5.0
+VERIFY_CPU_FACTOR = 1.2  # our run's CPU per recorded test second, with margin
+VERIFY_FIXED_SECONDS = 0.1  # fork and a fresh import of sqlglot
+VERIFY_WORTH = 0.5  # run when the estimate is below this share of the selection's board cost
+# setUpClass work a run pays once per test class (loading TPC tables, DuckDB, pandas)
+SETUP_SECONDS = {"tests/test_executor.py::TestExecutor": 1.0, "tests/test_optimizer.py::TestOptimizer": 0.3}
+WORKER_SECONDS = 2.0
 
 
 class Verifier:
@@ -88,9 +95,20 @@ class Verifier:
         self.numbers = {t["id"]: t["number"] for t in tests}
         self.checker = checker
 
+    def board_cost(self, chosen: set[int]) -> float:
+        workers = split(chosen, {n: round(self.seconds[n] * 1000) for n in chosen})
+        return max((sum(self.seconds[n] for n in w) for w in workers), default=0.0) + WORKER_SECONDS * len(workers)
+
+    def estimate(self, chosen: set[int]) -> float:
+        classes = {self.ids[n].rsplit("::", 1)[0] for n in chosen}
+        setup = sum(SETUP_SECONDS.get(c, 0.0) for c in classes)
+        return VERIFY_CPU_FACTOR * sum(self.seconds[n] for n in chosen) + setup + VERIFY_FIXED_SECONDS
+
     def verify(self, analyzer: Analyzer, chosen: set[int]) -> set[int]:
         cost = sum(self.seconds[n] for n in chosen)
         if not chosen or cost > VERIFY_MAX_SECONDS or not analyzer.verifiable:
+            return chosen
+        if self.estimate(chosen) > VERIFY_WORTH * self.board_cost(chosen):
             return chosen
         failed = self.checker.run_tests(
             analyzer.patched_sources, [self.ids[n] for n in sorted(chosen)], VERIFY_TIMEOUT_FACTOR * cost + 5
@@ -213,6 +231,8 @@ def main() -> None:
         log(f"{patch.stem}: {len(chosen)} tests")
     checker.close()
     sys.stdout.flush()
+    usage = [resource.getrusage(who) for who in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN)]
+    log(f"cpu seconds: {sum(u.ru_utime + u.ru_stime for u in usage):.2f}")
 
 
 if __name__ == "__main__":
