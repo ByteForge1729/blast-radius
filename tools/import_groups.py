@@ -113,7 +113,16 @@ def main() -> None:
         for path, lines in result["lines"].items():
             for line in lines:
                 line_groups[path][str(line)].append(gid)
-    out = {"lines": line_groups, "groups": {str(k): v for k, v in groups.items()}}
+    # dependents: module path -> module names whose import (after `import sqlglot`) loads it
+    dependents: dict[str, set[str]] = defaultdict(set)
+    for target in targets[1:]:
+        for path in results[target]["loaded"]:
+            dependents[path].add(target)
+    out = {
+        "lines": line_groups,
+        "groups": {str(k): v for k, v in groups.items()},
+        "dependents": {k: sorted(v) for k, v in dependents.items()},
+    }
     with gzip.open(os.path.join(maps, "import_groups.json.gz"), "wt", encoding="utf-8") as handle:
         json.dump(out, handle, separators=(",", ":"))
     print(f"{len(groups)} groups, {sum(len(v) for v in line_groups.values())} lines", file=sys.stderr)

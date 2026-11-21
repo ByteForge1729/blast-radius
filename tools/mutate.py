@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("BR_SQLGLOT", str(ROOT / "work" / "sqlglot"))
 
 from br.impact import Analyzer  # noqa: E402
+from br.importcheck import ImportChecker  # noqa: E402
 from selector import collection_modules, load_maps, select  # noqa: E402
 
 PRISTINE = ROOT / "work" / "sqlglot"
@@ -173,6 +174,7 @@ def main() -> None:
     id_of = {t["number"]: t["id"] for t in tests}
     analyzer = Analyzer(str(PRISTINE), load_maps(tests))
     modules = collection_modules()
+    checker = ImportChecker(str(PRISTINE), modules, analyzer.maps.import_groups.get("dependents", {}))
     OUT.mkdir(parents=True, exist_ok=True)
     if not SCRATCH.exists():
         shutil.copytree(PRISTINE, SCRATCH, ignore=shutil.ignore_patterns(".git", ".coverage*", "__pycache__"))
@@ -193,7 +195,7 @@ def main() -> None:
         patch = make_patch(rel, old, new)
         mid = f"{'c' if MODE == 'classconst' else 's'}{args.seed}-{done:03d}"
         (OUT / f"{mid}.patch").write_text(patch)
-        chosen = select(analyzer, patch, set(id_of), modules)
+        chosen = select(analyzer, patch, set(id_of), modules, checker)
         scratch_file = SCRATCH / rel
         scratch_file.write_text(new, encoding="utf-8")
         try:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import pickle
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -19,7 +20,7 @@ sys.path.insert(0, str(HERE))
 
 from br.diff import parse_patch  # noqa: E402
 from br.impact import ALL, Analyzer, Maps  # noqa: E402
-from br.importcheck import import_crashes  # noqa: E402
+from br.importcheck import ImportChecker  # noqa: E402
 from br.schedule import split  # noqa: E402
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -31,34 +32,43 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+def _load(name: str):
+    """Load maps/<name> (.json or .json.gz), preferring a .pickle made at image build."""
+    stem = name.removesuffix(".gz").removesuffix(".json")
+    pickled = MAPS / f"{stem}.pickle"
+    if pickled.exists():
+        with open(pickled, "rb") as handle:
+            return pickle.load(handle)
+    path = MAPS / name
+    if not path.exists():
+        return None
+    opener = gzip.open if name.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def load_maps(tests: list[dict]) -> Maps:
-    with gzip.open(MAPS / "coverage.json.gz", "rt", encoding="utf-8") as handle:
-        raw = json.load(handle)
-    coverage = {path: {int(k): v for k, v in lines.items()} for path, lines in raw.items()}
-    with open(MAPS / "fixtures.json", encoding="utf-8") as handle:
-        fixtures = json.load(handle)
-    classes: dict[str, list[int]] = {}
-    if (MAPS / "classes.json.gz").exists():
-        with gzip.open(MAPS / "classes.json.gz", "rt", encoding="utf-8") as handle:
-            classes = json.load(handle)
-    enums: frozenset[str] = frozenset()
-    if (MAPS / "enums.json").exists():
-        enums = frozenset(json.loads((MAPS / "enums.json").read_text()))
-    import_lines: dict[str, list[int]] = {}
-    if (MAPS / "import_lines.json").exists():
-        import_lines = json.loads((MAPS / "import_lines.json").read_text())
-    import_groups: dict = {}
-    if (MAPS / "import_groups.json.gz").exists():
-        with gzip.open(MAPS / "import_groups.json.gz", "rt", encoding="utf-8") as handle:
-            import_groups = json.load(handle)
+    raw = _load("coverage.json.gz")
+    if (MAPS / "coverage.pickle").exists():
+        coverage = raw  # already int-keyed
+    else:
+        coverage = {path: {int(k): v for k, v in lines.items()} for path, lines in raw.items()}
     by_file: dict[str, set[int]] = defaultdict(set)
     for test in tests:
         by_file[test["file"]].add(test["number"])
-    return Maps(coverage=coverage, fixtures=fixtures, tests_by_file=dict(by_file), classes=classes, enums=enums,
-                import_lines=import_lines, import_groups=import_groups)
+    return Maps(
+        coverage=coverage,
+        fixtures=_load("fixtures.json") or {},
+        tests_by_file=dict(by_file),
+        classes=_load("classes.json.gz") or {},
+        enums=frozenset(_load("enums.json") or ()),
+        import_lines=_load("import_lines.json") or {},
+        import_groups=_load("import_groups.json.gz") or {},
+    )
 
 
-def select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: list[str]) -> set[int]:
+def select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: list[str],
+           checker: ImportChecker) -> set[int]:
     chosen: set[int] = set()
     analyzer.import_time = {}
     for file_diff in parse_patch(patch_text):
@@ -66,7 +76,7 @@ def select(analyzer: Analyzer, patch_text: str, everything: set[int], modules: l
         if got is ALL:
             return set(everything)
         chosen |= got
-    if analyzer.import_time and import_crashes(SRC, analyzer.import_time, modules):
+    if analyzer.import_time and checker.crashes(analyzer.import_time):
         log("  import-time crash detected: selecting every test")
         return set(everything)
     return chosen & everything
@@ -90,14 +100,16 @@ def main() -> None:
     everything = set(ms_of)
     analyzer = Analyzer(SRC, load_maps(tests))
     modules = collection_modules()
+    checker = ImportChecker(SRC, modules, analyzer.maps.import_groups.get("dependents", {}))
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
-            chosen = select(analyzer, patch.read_text(encoding="utf-8", errors="replace"), everything, modules)
+            chosen = select(analyzer, patch.read_text(encoding="utf-8", errors="replace"), everything, modules, checker)
         except Exception as error:  # noqa: BLE001 - a crash must never cost a miss
             log(f"{patch.stem}: fallback to all tests ({type(error).__name__}: {error})")
             chosen = set(everything)
         print(json.dumps({"commit": patch.stem, "workers": split(chosen, ms_of)}))
         log(f"{patch.stem}: {len(chosen)} tests")
+    checker.close()
     sys.stdout.flush()
 
 

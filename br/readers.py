@@ -75,12 +75,12 @@ class ReaderIndex:
         def_path, def_start, def_end = defining
         out: list[Site] = []
         for path, text in self._all_texts().items():
-            if not word.search(text):
+            if name not in text or not word.search(text):
                 continue
             if quoted.search(text):
                 return None
             for lineno, line in enumerate(text.split("\n"), start=1):
-                if not word.search(line) or line.lstrip().startswith("#"):
+                if name not in line or not word.search(line) or line.lstrip().startswith("#"):
                     continue
                 if path == def_path and def_start <= lineno <= def_end:
                     continue

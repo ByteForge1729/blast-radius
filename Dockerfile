@@ -18,6 +18,8 @@ EOF
 COPY selector.py /app/selector.py
 COPY br /app/br
 COPY maps /app/maps
+COPY tools/pickle_maps.py /tmp/pickle_maps.py
+RUN python /tmp/pickle_maps.py /app/maps
 RUN python -m compileall -q /app /opt/sqlglot/sqlglot && chmod -R a+rX /app /opt/sqlglot
 
 ENV BR_SQLGLOT=/opt/sqlglot

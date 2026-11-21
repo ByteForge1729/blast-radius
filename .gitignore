@@ -14,3 +14,4 @@ dist/
 work/
 output.jsonl
 run.log
+maps/*.pickle
