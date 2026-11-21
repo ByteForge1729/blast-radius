@@ -15,6 +15,7 @@ import argparse
 import ast
 import difflib
 import json
+import os
 import random
 import shutil
 import subprocess
@@ -23,10 +24,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+os.environ.setdefault("BR_SQLGLOT", str(ROOT / "work" / "sqlglot"))
 
-from br.diff import parse_patch  # noqa: E402
-from br.impact import ALL, Analyzer  # noqa: E402
-from selector import load_maps  # noqa: E402
+from br.impact import Analyzer  # noqa: E402
+from selector import collection_modules, load_maps, select  # noqa: E402
 
 PRISTINE = ROOT / "work" / "sqlglot"
 SCRATCH = ROOT / "work" / "mutsrc"
@@ -171,6 +172,7 @@ def main() -> None:
     tests = json.loads((ROOT / "sample" / "tests.json").read_text())["tests"]
     id_of = {t["number"]: t["id"] for t in tests}
     analyzer = Analyzer(str(PRISTINE), load_maps(tests))
+    modules = collection_modules()
     OUT.mkdir(parents=True, exist_ok=True)
     if not SCRATCH.exists():
         shutil.copytree(PRISTINE, SCRATCH, ignore=shutil.ignore_patterns(".git", ".coverage*", "__pycache__"))
@@ -191,10 +193,7 @@ def main() -> None:
         patch = make_patch(rel, old, new)
         mid = f"{'c' if MODE == 'classconst' else 's'}{args.seed}-{done:03d}"
         (OUT / f"{mid}.patch").write_text(patch)
-        chosen: set[int] = set()
-        for fd in parse_patch(patch):
-            got = analyzer.tests_for(fd)
-            chosen = set(id_of) if got is ALL else chosen | got
+        chosen = select(analyzer, patch, set(id_of), modules)
         scratch_file = SCRATCH / rel
         scratch_file.write_text(new, encoding="utf-8")
         try:
