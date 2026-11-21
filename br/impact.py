@@ -84,6 +84,10 @@ def _base_name(node: ast.AST) -> str:
     return node.id if isinstance(node, ast.Name) else ""
 
 
+def _is_enum(cls: ast.ClassDef, enums: frozenset[str]) -> bool:
+    return bool({_base_name(b) for b in cls.bases} & (ENUM_BASES | set(enums)))
+
+
 def _has_generic_fields(cls: ast.ClassDef, enums: frozenset[str]) -> bool:
     """Dataclasses, enums and named tuples read their class-level names generically
     (generated __init__/__eq__/__repr__, member iteration and value lookup), so a
@@ -378,7 +382,7 @@ class Analyzer:
             stmt = stmts[-1] if stmts else None
             self._record_keys(chain, stmt, line)
             if classes and _has_generic_fields(classes[-1], self.maps.enums):
-                return broad
+                return self._generic_broad(path, classes, broad)
             defining = (path, _start(stmt), stmt.end_lineno) if stmt is not None else (path, 0, -1)
             return self._narrow(path, stmt, defining, broad)
         idx = funcs[-1]
@@ -406,6 +410,13 @@ class Analyzer:
         runtime = self._range(path, start, end)
         self._info.runtime |= runtime
         return _union([runtime, self._import_effect(path, start, end)])
+
+    def _generic_broad(self, path: str, classes: list[ast.AST], broad: set[int] | None) -> set[int] | None:
+        """An enum member is never constructed: its value reaches whoever uses the enum,
+        so add every test that ran code in the defining module."""
+        if _is_enum(classes[-1], self.maps.enums):
+            return _union([broad, self._module(path)])
+        return broad
 
     def _record_keys(self, chain: list[ast.AST], stmt: ast.AST | None, line: int) -> None:
         """Remember the class/module-level names a statement binds, for refine()."""
@@ -438,7 +449,7 @@ class Analyzer:
             self._record_keys(chain, stmt, new_line)
             classes = [n for n in chain if isinstance(n, ast.ClassDef)]
             if classes and _has_generic_fields(classes[-1], self.maps.enums):
-                return self._broad_new(path, old_tree, chain)
+                return self._generic_broad(path, classes, self._broad_new(path, old_tree, chain))
             # a new import-time statement runs where its neighbours ran: use their import groups
             return self._narrow(path, stmt, (path, max(point - 1, 1), point), self._broad_new(path, old_tree, chain))
         named = [n for n in chain if isinstance(n, NAMED_FUNCS)]
