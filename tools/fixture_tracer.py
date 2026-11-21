@@ -11,6 +11,7 @@ import io
 import json
 import os
 import pickle
+import sys
 
 import pytest
 
@@ -70,20 +71,34 @@ class InlineExecutor:
 
 
 _classes: dict[str, set[str]] = {}
+_key_cache: dict[type, tuple[str, ...]] = {}
 
 
-def _class_keys(cls) -> list[str]:
-    keys = []
-    for klass in cls.__mro__:
-        module = getattr(klass, "__module__", "") or ""
-        if module.startswith("sqlglot.expressions"):
-            keys.append(module.replace(".", "/") + ".py::" + klass.__qualname__)
-    return keys
+def _module_path(module_name: str) -> str | None:
+    module = sys.modules.get(module_name)
+    path = getattr(module, "__file__", None)
+    if not path or not module_name.startswith("sqlglot"):
+        return None
+    base = module_name.replace(".", "/")
+    return f"{base}/__init__.py" if path.endswith("__init__.py") else f"{base}.py"
+
+
+def _class_keys(cls) -> tuple[str, ...]:
+    """'sqlglot/<file>.py::<Qualname>' for every sqlglot class in cls's MRO."""
+    cached = _key_cache.get(cls)
+    if cached is None:
+        keys = []
+        for klass in cls.__mro__:
+            path = _module_path(getattr(klass, "__module__", "") or "")
+            if path:
+                keys.append(f"{path}::{klass.__qualname__}")
+        cached = _key_cache[cls] = tuple(keys)
+    return cached
 
 
 def _wrap_init(klass) -> None:
     original = klass.__dict__.get("__init__")
-    if original is None:
+    if original is None or getattr(original, "_br_wrapped", False):
         return
 
     def __init__(self, *args, **kwargs):
@@ -91,16 +106,30 @@ def _wrap_init(klass) -> None:
             _classes.setdefault(_current[0], set()).update(_class_keys(type(self)))
         return original(self, *args, **kwargs)
 
-    klass.__init__ = __init__
+    __init__._br_wrapped = True
+    try:
+        klass.__init__ = __init__
+    except (TypeError, AttributeError):
+        pass
 
 
-def _record_expression_classes() -> None:
-    """Record which expression classes each test constructs (class-level edits reach them)."""
-    from sqlglot.expressions import core
+def _record_class_usage() -> None:
+    """Record which sqlglot classes each test constructs, so class-level edits reach them.
 
-    for name in ("Expr", "Expression"):
-        if hasattr(core, name):
-            _wrap_init(getattr(core, name))
+    Wraps every __init__ defined by a class in an already-imported sqlglot module;
+    subclasses imported later (lazy dialects) inherit the wrapped __init__.
+    """
+    import inspect
+
+    import sqlglot  # noqa: F401 - loads the core modules
+    from sqlglot.dialects.dialect import Dialect  # noqa: F401
+
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("sqlglot") or module is None:
+            continue
+        for _, klass in inspect.getmembers(module, inspect.isclass):
+            if getattr(klass, "__module__", "") == name:
+                _wrap_init(klass)
 
 
 def pytest_configure(config):
@@ -109,7 +138,7 @@ def pytest_configure(config):
     builtins.open = _traced_open
     io.open = _traced_open
     if os.environ.get("TRACE_CLASSES"):
-        _record_expression_classes()
+        _record_class_usage()
 
 
 def pytest_unconfigure(config):

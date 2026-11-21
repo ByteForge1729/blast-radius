@@ -167,18 +167,30 @@ class Analyzer:
         """Tests that can see an import-time change in `path` (inside the innermost class)."""
         if path.startswith("tests/") and path in self.maps.tests_by_file:
             return set(self.maps.tests_by_file[path])
-        if classes and path.startswith("sqlglot/expressions/"):
-            key = f"{path}::{'.'.join(c.name for c in classes)}"
-            used = set(self.maps.classes.get(key, ()))
+        used: set[int] = set()
+        in_class: set[int] = set()
+        if classes:
+            used = self._class_users(path, classes)
             in_class = self._range(path, _start(classes[-1]), classes[-1].end_lineno)
-            if used or in_class:
-                return used | in_class
+        if classes and path.startswith("sqlglot/expressions/") and (used or in_class):
+            return used | in_class
         module = self._module(path)
         if module is ALL or not classes:
             return module
-        in_class = self._range(path, _start(classes[-1]), classes[-1].end_lineno)
         is_family = path.count("/") == 2 and path.split("/")[1] in FAMILY_DIRS
-        return (in_class | module) if is_family else (in_class or module)
+        if is_family:
+            return in_class | module | used
+        return (in_class | used) if (in_class or used) else module
+
+    def _class_users(self, path: str, classes: list[ast.AST]) -> set[int]:
+        """Tests that constructed this class or a subclass (any nesting prefix counts)."""
+        names = [c.name for c in classes]
+        users: set[int] = set()
+        for depth in range(len(names), 0, -1):
+            users |= set(self.maps.classes.get(f"{path}::{'.'.join(names[:depth])}", ()))
+            if users:
+                break
+        return users
 
     # ---- per-line analysis on the old tree --------------------------------
     def _old_line(self, path: str, tree: ast.AST, line: int) -> set[int] | None:
